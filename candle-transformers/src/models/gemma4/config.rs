@@ -100,6 +100,12 @@ pub struct Gemma4TextConfig {
     pub use_double_wide_mlp: bool,
     #[serde(default)]
     pub num_kv_shared_layers: usize,
+    /// Per-Layer Embeddings (PLE): auxiliary per-layer input signal
+    /// (e.g. gemma-4-E2B-it). 0 disables the feature.
+    #[serde(default)]
+    pub hidden_size_per_layer_input: usize,
+    #[serde(default)]
+    pub vocab_size_per_layer_input: usize,
     #[serde(
         default = "default_sliding_window_pattern",
         alias = "_sliding_window_pattern"
