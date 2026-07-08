@@ -96,6 +96,10 @@ pub struct Gemma4TextConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub use_double_wide_mlp: bool,
+    #[serde(default)]
+    pub num_kv_shared_layers: usize,
     #[serde(
         default = "default_sliding_window_pattern",
         alias = "_sliding_window_pattern"

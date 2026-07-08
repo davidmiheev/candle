@@ -413,9 +413,17 @@ impl DecoderLayer {
             layer_idx,
             vb.pp("self_attn"),
         )?;
+        // Models with `use_double_wide_mlp` (e.g. gemma-4-E2B-it) widen the MLP to
+        // 2*intermediate_size in the trailing `num_kv_shared_layers` layers.
+        let mut mlp_intermediate_size = cfg.intermediate_size;
+        if cfg.use_double_wide_mlp
+            && layer_idx >= cfg.num_hidden_layers.saturating_sub(cfg.num_kv_shared_layers)
+        {
+            mlp_intermediate_size *= 2;
+        }
         let mlp = MLP::new(
             cfg.hidden_size,
-            cfg.intermediate_size,
+            mlp_intermediate_size,
             cfg.hidden_activation,
             false,
             vb.pp("mlp"),
