@@ -4,10 +4,68 @@
 
 use std::sync::Arc;
 
+use candle::quantized::{GgmlDType, QMatMul, QTensor};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{linear_b as linear_bias, Activation, Linear, VarBuilder};
 
 use super::config::Gemma4TextConfig;
+
+// ── Projection (dense or quantized-in-memory) ───────────────────────────────
+
+/// Linear projection that can be quantized at load time: the checkpoint
+/// weight is converted to the given GGML dtype and matmuls run through the
+/// quantized kernels while activations stay in the model dtype. This trades a
+/// one-time load cost for ~4x weight memory and integer-dot decode kernels —
+/// no second (GGUF) checkpoint file is needed.
+#[derive(Debug, Clone)]
+enum Proj {
+    Plain(Linear),
+    Quant {
+        weight: QMatMul,
+        bias: Option<Tensor>,
+    },
+}
+
+impl Proj {
+    fn new(
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        match quant {
+            None => Ok(Self::Plain(linear_bias(in_dim, out_dim, bias, vb)?)),
+            Some(dtype) => {
+                let weight = vb
+                    .get((out_dim, in_dim), "weight")?
+                    .to_dtype(DType::F32)?;
+                let weight = QMatMul::from_qtensor(QTensor::quantize(&weight, dtype)?)?;
+                let bias = if bias {
+                    Some(vb.get(out_dim, "bias")?.to_dtype(DType::F32)?)
+                } else {
+                    None
+                };
+                Ok(Self::Quant { weight, bias })
+            }
+        }
+    }
+}
+
+impl Module for Proj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Plain(l) => l.forward(xs),
+            Self::Quant { weight, bias } => {
+                let xs = weight.forward(xs)?;
+                match bias {
+                    None => Ok(xs),
+                    Some(b) => xs.broadcast_add(b),
+                }
+            }
+        }
+    }
+}
 
 // ── RmsNorm (Gemma-style with +1 offset) ────────────────────────────────────
 
@@ -155,9 +213,9 @@ impl ProportionalRotaryEmbedding {
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 struct MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: Proj,
+    up_proj: Proj,
+    down_proj: Proj,
     act_fn: Activation,
 }
 
@@ -168,10 +226,11 @@ impl MLP {
         act: Activation,
         bias: bool,
         vb: VarBuilder,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
-        let gate_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("gate_proj"))?;
-        let up_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("up_proj"))?;
-        let down_proj = linear_bias(intermediate_size, hidden_size, bias, vb.pp("down_proj"))?;
+        let gate_proj = Proj::new(hidden_size, intermediate_size, bias, vb.pp("gate_proj"), quant)?;
+        let up_proj = Proj::new(hidden_size, intermediate_size, bias, vb.pp("up_proj"), quant)?;
+        let down_proj = Proj::new(intermediate_size, hidden_size, bias, vb.pp("down_proj"), quant)?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -228,11 +287,11 @@ pub(crate) struct SharedKvStates {
 
 #[derive(Debug, Clone)]
 struct Attention {
-    q_proj: Linear,
+    q_proj: Proj,
     // K/V projections and k_norm are absent on KV-shared layers.
-    k_proj: Option<Linear>,
-    v_proj: Option<Linear>,
-    o_proj: Linear,
+    k_proj: Option<Proj>,
+    v_proj: Option<Proj>,
+    o_proj: Proj,
     q_norm: RmsNorm,
     k_norm: Option<RmsNorm>,
     num_heads: usize,
@@ -257,6 +316,7 @@ impl Attention {
         cfg: &Gemma4TextConfig,
         layer_idx: usize,
         vb: VarBuilder,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
@@ -289,27 +349,29 @@ impl Attention {
                 .rposition(|t| t == layer_type)
                 == Some(layer_idx);
 
-        let q_proj = linear_bias(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"))?;
+        let q_proj = Proj::new(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"), quant)?;
         let (k_proj, v_proj, k_norm) = if is_kv_shared {
             (None, None, None)
         } else {
             (
-                Some(linear_bias(
+                Some(Proj::new(
                     hidden_sz,
                     num_kv_heads * head_dim,
                     bias,
                     vb.pp("k_proj"),
+                    quant,
                 )?),
-                Some(linear_bias(
+                Some(Proj::new(
                     hidden_sz,
                     num_kv_heads * head_dim,
                     bias,
                     vb.pp("v_proj"),
+                    quant,
                 )?),
                 Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?),
             )
         };
-        let o_proj = linear_bias(num_heads * head_dim, hidden_sz, bias, vb.pp("o_proj"))?;
+        let o_proj = Proj::new(num_heads * head_dim, hidden_sz, bias, vb.pp("o_proj"), quant)?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
 
         let kv_cache = if is_sliding {
@@ -474,8 +536,8 @@ struct DecoderLayer {
     post_feedforward_layernorm: RmsNorm,
     // Per-Layer Embeddings (PLE) integration, present when
     // cfg.hidden_size_per_layer_input > 0 (e.g. gemma-4-E2B-it).
-    per_layer_input_gate: Option<Linear>,
-    per_layer_projection: Option<Linear>,
+    per_layer_input_gate: Option<Proj>,
+    per_layer_projection: Option<Proj>,
     post_per_layer_input_norm: Option<RmsNorm>,
     act_fn: candle_nn::Activation,
     /// Learned scalar applied to the layer output (1.0 when absent).
@@ -491,6 +553,7 @@ impl DecoderLayer {
         cfg: &Gemma4TextConfig,
         layer_idx: usize,
         vb: VarBuilder,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let is_sliding = cfg.is_sliding(layer_idx);
         let self_attn = Attention::new(
@@ -499,6 +562,7 @@ impl DecoderLayer {
             cfg,
             layer_idx,
             vb.pp("self_attn"),
+            quant,
         )?;
         // Models with `use_double_wide_mlp` (e.g. gemma-4-E2B-it) widen the MLP to
         // 2*intermediate_size in the trailing `num_kv_shared_layers` layers.
@@ -514,6 +578,7 @@ impl DecoderLayer {
             cfg.hidden_activation,
             false,
             vb.pp("mlp"),
+            quant,
         )?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -536,17 +601,19 @@ impl DecoderLayer {
         let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
             if cfg.hidden_size_per_layer_input > 0 {
                 (
-                    Some(linear_bias(
+                    Some(Proj::new(
                         cfg.hidden_size,
                         cfg.hidden_size_per_layer_input,
                         false,
                         vb.pp("per_layer_input_gate"),
+                        quant,
                     )?),
-                    Some(linear_bias(
+                    Some(Proj::new(
                         cfg.hidden_size_per_layer_input,
                         cfg.hidden_size,
                         false,
                         vb.pp("per_layer_projection"),
+                        quant,
                     )?),
                     Some(RmsNorm::new(
                         cfg.hidden_size,
@@ -678,12 +745,12 @@ pub struct TextModel {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: Proj,
     final_logit_softcapping: Option<f64>,
     // Per-Layer Embeddings (PLE) pipeline, present when
     // cfg.hidden_size_per_layer_input > 0.
     embed_tokens_per_layer: Option<candle_nn::Embedding>,
-    per_layer_model_projection: Option<Linear>,
+    per_layer_model_projection: Option<Proj>,
     per_layer_projection_norm: Option<RmsNorm>,
     hidden_size_per_layer_input: usize,
     num_hidden_layers: usize,
@@ -695,9 +762,29 @@ pub struct TextModel {
 
 impl TextModel {
     pub fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_quant(cfg, vb, None)
+    }
+
+    /// Like [`Self::new`], but with `quant` set every linear projection is
+    /// quantized to that GGML dtype at load time (activations stay in the
+    /// VarBuilder dtype) and the gather-only embedding tables are stored in
+    /// F16 — on gemma-4-E2B-it the PLE table alone is 2.35B parameters.
+    pub fn new_with_quant(
+        cfg: &Gemma4TextConfig,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
-        let embed_tokens =
-            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let embed_dtype = if quant.is_some() {
+            DType::F16
+        } else {
+            vb.dtype()
+        };
+        let embed_tokens = candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb_m.pp("embed_tokens").set_dtype(embed_dtype),
+        )?;
 
         let rotary_emb_global = Arc::new(ProportionalRotaryEmbedding::new(
             vb.dtype(),
@@ -724,14 +811,26 @@ impl TextModel {
                 cfg,
                 layer_idx,
                 vb_l.pp(layer_idx),
+                quant,
             )?;
             layers.push(layer)
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            match quant {
+                // Tied head: quantize a copy of the embedding table rather
+                // than matmul against the F16 gather table.
+                Some(dtype) => {
+                    let weight = embed_tokens.embeddings().to_dtype(DType::F32)?;
+                    Proj::Quant {
+                        weight: QMatMul::from_qtensor(QTensor::quantize(&weight, dtype)?)?,
+                        bias: None,
+                    }
+                }
+                None => Proj::Plain(Linear::new(embed_tokens.embeddings().clone(), None)),
+            }
         } else {
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            Proj::new(cfg.hidden_size, cfg.vocab_size, false, vb.pp("lm_head"), quant)?
         };
 
         let (embed_tokens_per_layer, per_layer_model_projection, per_layer_projection_norm) =
@@ -740,13 +839,14 @@ impl TextModel {
                     Some(candle_nn::embedding(
                         cfg.vocab_size_per_layer_input,
                         cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
-                        vb_m.pp("embed_tokens_per_layer"),
+                        vb_m.pp("embed_tokens_per_layer").set_dtype(embed_dtype),
                     )?),
-                    Some(linear_bias(
+                    Some(Proj::new(
                         cfg.hidden_size,
                         cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
                         false,
                         vb_m.pp("per_layer_model_projection"),
+                        quant,
                     )?),
                     Some(RmsNorm::new(
                         cfg.hidden_size_per_layer_input,
@@ -791,7 +891,8 @@ impl TextModel {
         let (b_size, seq_len) = input_ids.dims2()?;
         let per_dim = self.hidden_size_per_layer_input;
 
-        let ple = (ple_embed.forward(input_ids)? * (per_dim as f64).sqrt())?
+        // Gather tables may be stored in F16 (quantized mode) — upcast after lookup.
+        let ple = (ple_embed.forward(input_ids)?.to_dtype(self.dtype)? * (per_dim as f64).sqrt())?
             .reshape((b_size, seq_len, self.num_hidden_layers, per_dim))?;
 
         let projected = (inputs_embeds.apply(proj)? * (self.hidden_size as f64).sqrt().recip())?
@@ -831,7 +932,8 @@ impl TextModel {
     }
 
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let xs = self.embed_tokens.forward(input_ids)?;
+        // The table may be stored in F16 (quantized mode) — upcast after lookup.
+        let xs = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
         xs * (self.hidden_size as f64).sqrt()
     }
 
