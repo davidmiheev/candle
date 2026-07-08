@@ -300,6 +300,13 @@ fn apply_rotary_pos_emb_vision(
 /// Balances memory usage vs throughput. 512 keeps peak memory under ~500MB per tile.
 const ATTENTION_TILE_SIZE: usize = 512;
 
+/// Upper bound on materialized attention-score elements for the standard
+/// (non-chunked) path: heads * q_seq * kv_seq. 512M elements = 2 GB in F32.
+/// Below this, one fused parallel softmax over the full score matrix beats the
+/// tiled online-softmax path, whose many separate elementwise ops
+/// (exp/mul/sub per tile) run single-threaded on CPU.
+const MAX_STANDARD_ATTN_ELEMS: usize = 512 * 1024 * 1024;
+
 /// Chunked attention with online softmax for memory efficiency.
 ///
 /// For large sequences that would exceed GPU memory limits (e.g., 14K+ patches from
@@ -321,8 +328,11 @@ fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<T
     let device = q.device();
     let dtype = q.dtype();
 
-    // For small sequences, use standard attention (fits in memory)
-    if kv_seq <= ATTENTION_TILE_SIZE {
+    // Standard attention whenever the full score matrix is affordable — the
+    // fused softmax_last_dim is parallel while the tiled path pays many
+    // sequential elementwise kernels. Only very large patch counts (~14K+,
+    // i.e. >2 GB of scores) take the chunked path.
+    if kv_seq <= ATTENTION_TILE_SIZE || num_heads * q_seq * kv_seq <= MAX_STANDARD_ATTN_ELEMS {
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
         return attn_weights.matmul(v);
@@ -727,37 +737,17 @@ impl Projector {
             let features = normed.narrow(0, offset, seq_len)?;
             offset += seq_len;
 
-            // Reshape to (t, h, w, hidden)
-            let features = features.reshape((t, h, w, self.hidden_size))?;
-
             // Merged dimensions
             let h_merged = h / m;
             let w_merged = w / m;
 
-            // Gather 2×2 blocks: for each merged position, collect m×m patches
-            // and concatenate their features
-            let mut blocks = Vec::with_capacity(t * h_merged * w_merged);
-
-            for ti in 0..t {
-                for hi in 0..h_merged {
-                    for wi in 0..w_merged {
-                        // Collect m×m patches at this merged position
-                        let mut patch_features = Vec::with_capacity(m * m);
-                        for mi in 0..m {
-                            for mj in 0..m {
-                                let patch = features.i((ti, hi * m + mi, wi * m + mj))?;
-                                patch_features.push(patch);
-                            }
-                        }
-                        // Concatenate patch features: (m*m, hidden) -> (m*m * hidden,)
-                        let block = Tensor::cat(&patch_features, 0)?;
-                        blocks.push(block);
-                    }
-                }
-            }
-
-            // Stack all blocks: (t * h_merged * w_merged, merged_hidden)
-            let merged = Tensor::stack(&blocks, 0)?;
+            // Vectorized einops "(t h m1 w m2) d -> (t h w) (m1 m2 d)":
+            // one reshape/permute instead of per-block gathers.
+            let merged = features
+                .reshape((t, h_merged, m, w_merged, m, self.hidden_size))?
+                .permute((0, 1, 3, 2, 4, 5))?
+                .contiguous()?
+                .reshape((t * h_merged * w_merged, m * m * self.hidden_size))?;
             merged_features.push(merged);
         }
 
@@ -802,34 +792,16 @@ impl Projector {
             let features = normed.narrow(0, offset, seq_len)?;
             offset += seq_len;
 
-            // Reshape to (t, h, w, hidden)
-            let features = features.reshape((t, h, w, self.hidden_size))?;
-
             // Merged dimensions
             let h_merged = h / m;
             let w_merged = w / m;
 
-            // Gather 2×2 blocks
-            let mut blocks = Vec::with_capacity(t * h_merged * w_merged);
-
-            for ti in 0..t {
-                for hi in 0..h_merged {
-                    for wi in 0..w_merged {
-                        let mut patch_features = Vec::with_capacity(m * m);
-                        for mi in 0..m {
-                            for mj in 0..m {
-                                let patch = features.i((ti, hi * m + mi, wi * m + mj))?;
-                                patch_features.push(patch);
-                            }
-                        }
-                        let block = Tensor::cat(&patch_features, 0)?;
-                        blocks.push(block);
-                    }
-                }
-            }
-
-            // Stack all blocks: (t * h_merged * w_merged, merged_hidden)
-            let merged = Tensor::stack(&blocks, 0)?;
+            // Vectorized einops "(t h m1 w m2) d -> (t h w) (m1 m2 d)".
+            let merged = features
+                .reshape((t, h_merged, m, w_merged, m, self.hidden_size))?
+                .permute((0, 1, 3, 2, 4, 5))?
+                .contiguous()?
+                .reshape((t * h_merged * w_merged, m * m * self.hidden_size))?;
 
             // Apply MLP
             let xs = self.linear_1.forward(&merged)?;

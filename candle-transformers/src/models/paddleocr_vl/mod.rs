@@ -181,8 +181,10 @@ impl PaddleOCRVLModel {
         // If we have images, encode them and inject into embeddings
         if let (Some(pixel_values), Some(grid_thw)) = (pixel_values, grid_thw) {
             // Encode images
+            let t_vision = std::time::Instant::now();
             let image_embeds = self.encode_image(pixel_values, grid_thw)?;
             let image_embeds = image_embeds.to_dtype(self.dtype)?;
+            let vision_ms = t_vision.elapsed().as_millis();
 
             // Get grid dimensions for M-RoPE (after 2x2 merge)
             let grid_thw_vec: Vec<u32> = grid_thw.flatten_all()?.to_vec1()?;
@@ -192,28 +194,44 @@ impl PaddleOCRVLModel {
                 merged_grid_w = (grid_thw_vec[2] as usize) / spatial_merge_size;
             }
 
-            // Find image token positions and replace with image embeddings
+            // Find image token positions and replace with image embeddings.
+            // Image tokens sit in contiguous runs, and each slice_assign
+            // rebuilds the whole embedding tensor — assign per run, not per
+            // token (per token this was ~9 GB of memcpy for a 1K-token page).
             let input_ids_flat = input_ids.flatten_all()?;
             let input_ids_vec = input_ids_flat.to_vec1::<u32>()?;
 
+            let t_inject = std::time::Instant::now();
             let mut image_offset = 0usize;
             let num_image_tokens = image_embeds.dim(0)?;
 
             for batch in 0..batch_size {
-                for pos in 0..seq_len {
+                let mut pos = 0usize;
+                while pos < seq_len && image_offset < num_image_tokens {
                     let idx = batch * seq_len + pos;
-                    if input_ids_vec[idx] == self.image_token_id && image_offset < num_image_tokens
-                    {
-                        // Replace this token's embedding with image embedding
-                        let img_emb = image_embeds.i(image_offset)?.unsqueeze(0)?.unsqueeze(0)?;
-                        input_embeds = input_embeds.slice_assign(
-                            &[batch..batch + 1, pos..pos + 1, 0..hidden_dim],
-                            &img_emb,
-                        )?;
-                        image_offset += 1;
+                    if input_ids_vec[idx] != self.image_token_id {
+                        pos += 1;
+                        continue;
                     }
+                    let mut run_len = 1usize;
+                    while pos + run_len < seq_len
+                        && image_offset + run_len < num_image_tokens
+                        && input_ids_vec[idx + run_len] == self.image_token_id
+                    {
+                        run_len += 1;
+                    }
+                    let img_emb = image_embeds
+                        .narrow(0, image_offset, run_len)?
+                        .unsqueeze(0)?;
+                    input_embeds = input_embeds.slice_assign(
+                        &[batch..batch + 1, pos..pos + run_len, 0..hidden_dim],
+                        &img_emb,
+                    )?;
+                    image_offset += run_len;
+                    pos += run_len;
                 }
             }
+            let inject_ms = t_inject.elapsed().as_millis();
 
             // Use M-RoPE with 3D position IDs for prefill with vision tokens
             let position_ids = compute_mrope_position_ids(
@@ -230,9 +248,15 @@ impl PaddleOCRVLModel {
             let max_pos = position_ids_vec.iter().copied().max().unwrap_or(0);
             self.mrope_position_delta = max_pos + 1 - seq_len as i64;
 
-            return self
+            let t_text = std::time::Instant::now();
+            let out = self
                 .text
-                .forward_embeds_with_mrope(input_embeds, &position_ids);
+                .forward_embeds_with_mrope(input_embeds, &position_ids)?;
+            eprintln!(
+                "[paddleocr_vl] prefill stages: vision_encode={vision_ms}ms inject={inject_ms}ms text_prefill={}ms (seq_len={seq_len})",
+                t_text.elapsed().as_millis()
+            );
+            return Ok(out);
         }
 
         // Forward through text model with M-RoPE (for incremental decoding)
