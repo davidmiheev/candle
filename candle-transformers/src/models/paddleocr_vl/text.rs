@@ -733,9 +733,13 @@ struct Attention {
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: candle_nn::kv_cache::KvCache,
     softmax_scale: f64,
 }
+
+/// Initial KV-cache capacity (seq dim). The cache grows on demand, so this is
+/// a soft sizing hint covering typical image prefill + generation.
+const KV_CACHE_INIT_LEN: usize = 4096;
 
 impl Attention {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
@@ -780,7 +784,7 @@ impl Attention {
             num_kv_groups,
             head_dim,
             rotary_emb,
-            kv_cache: None,
+            kv_cache: candle_nn::kv_cache::KvCache::new(2, KV_CACHE_INIT_LEN),
             softmax_scale: 1.0 / (head_dim as f64).sqrt(),
         })
     }
@@ -835,32 +839,40 @@ impl Attention {
         b_sz: usize,
         q_len: usize,
     ) -> Result<Tensor> {
-        // KV cache handling
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // Append only the new K/V into the preallocated cache; the returned
+        // views cover the whole sequence. This replaces the previous
+        // full-sequence `Tensor::cat` per decode step.
+        let (key_states, value_states) = self
+            .kv_cache
+            .append(&key_states.contiguous()?, &value_states.contiguous()?)?;
+        let kv_len = key_states.dim(2)?;
 
-        // Repeat KV heads for GQA (matches PyTorch's repeat_kv)
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states =
-            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        // GQA via broadcast: fold the query-head groups into the row dim so
+        // K/V are never materialized `num_kv_groups` times (the previous
+        // `repeat_kv(..).contiguous()` copied an 8x-expanded K/V of the whole
+        // sequence on every decode step).
+        let groups = self.num_kv_groups;
+        let query_states = query_states.contiguous()?.reshape((
+            b_sz,
+            self.num_kv_heads,
+            groups * q_len,
+            self.head_dim,
+        ))?;
 
         // Compute attention (matches eager_attention_forward_ernie)
         let attn_output = {
-            // attn_weights = query @ key^T * scaling
+            // attn_weights = query @ key^T * scaling — [b, kv, g*q, s]
             let attn_weights =
                 (query_states.matmul(&key_states.transpose(2, 3)?)? * self.softmax_scale)?;
 
-            // Apply causal mask
+            // Apply causal mask ([b, 1, q, s]) — broadcast over kv-heads and
+            // groups through a 5-D view.
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
+                Some(mask) => attn_weights
+                    .reshape((b_sz, self.num_kv_heads, groups, q_len, kv_len))?
+                    .broadcast_add(&mask.unsqueeze(1)?)?
+                    .reshape((b_sz, self.num_kv_heads, groups * q_len, kv_len))?,
             };
             // Softmax in F32 for stability (matches PyTorch's softmax(..., dtype=torch.float32).to(query.dtype))
             let original_dtype = attn_weights.dtype();
@@ -871,12 +883,13 @@ impl Attention {
             } else {
                 candle_nn::ops::softmax_last_dim(&attn_weights)?
             };
-            // attn_output = attn_weights @ value
+            // attn_output = attn_weights @ value — [b, kv, g*q, d]
             attn_weights.matmul(&value_states)?
         };
 
-        // attn_output.transpose(1, 2).contiguous().reshape(...)
+        // [b, kv, g*q, d] -> [b, H, q, d] -> [b, q, H*d]
         attn_output
+            .reshape((b_sz, self.num_heads, q_len, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
@@ -990,7 +1003,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 
@@ -1189,11 +1202,11 @@ impl TextModel {
 
         xs = xs.apply(&self.norm)?;
 
-        // Only compute logits for last token
-        self.lm_head
-            .forward(&xs)?
-            .i((.., seq_len - 1, ..))?
-            .contiguous()
+        // Only compute logits for the last token — narrow BEFORE the lm_head so
+        // prefill doesn't pay a [seq_len, vocab] projection for rows it throws
+        // away (vocab is ~100k; on a ~1k-token image prefill that's ~100 GFLOP).
+        let last = xs.i((.., seq_len - 1, ..))?.contiguous()?;
+        self.lm_head.forward(&last)
     }
 
     /// Clear all KV caches.
