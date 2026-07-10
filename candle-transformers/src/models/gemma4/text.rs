@@ -1310,3 +1310,33 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod config_null_tests {
+    use super::config_null_tests_support::*;
+
+    #[test]
+    fn explicit_nulls_parse_as_defaults() {
+        let cfg = parse_e2b_style_config();
+        assert!(!cfg.enable_moe_block);
+        assert_eq!(cfg.num_experts, 0);
+        assert_eq!(cfg.top_k_experts, 0);
+        assert!(!cfg.attention_k_eq_v);
+    }
+}
+
+#[cfg(test)]
+mod config_null_tests_support {
+    pub fn parse_e2b_style_config() -> super::Gemma4TextConfig {
+        serde_json::from_str(
+            r#"{
+              "hidden_size": 32, "intermediate_size": 16, "num_hidden_layers": 1,
+              "layer_types": ["sliding_attention"], "sliding_window": 4,
+              "num_experts": null, "top_k_experts": null, "enable_moe_block": null,
+              "attention_k_eq_v": null, "moe_intermediate_size": null,
+              "num_global_key_value_heads": null, "use_bidirectional_attention": null
+            }"#,
+        )
+        .expect("null-bearing config parses")
+    }
+}

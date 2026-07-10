@@ -47,6 +47,18 @@ fn default_use_flash_attn() -> bool {
     false
 }
 
+/// serde(default) alone rejects explicit `null` (present in real gemma-4
+/// configs, e.g. `"num_experts": null` on non-MoE checkpoints) — treat null
+/// as the default value.
+fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 // ── Rope parameters ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -121,17 +133,17 @@ pub struct Gemma4TextConfig {
     pub use_flash_attn: bool,
     /// MoE block (e.g. gemma-4-26B-A4B-it): each layer adds a routed
     /// mixture-of-experts branch alongside the dense MLP.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub enable_moe_block: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub num_experts: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub top_k_experts: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub moe_intermediate_size: usize,
     /// Global (full-attention) layers share the K projection for V — the
     /// checkpoint has no v_proj on those layers (e.g. gemma-4-26B-A4B-it).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub attention_k_eq_v: bool,
 }
 
