@@ -119,6 +119,20 @@ pub struct Gemma4TextConfig {
     pub use_bidirectional_attention: Option<String>,
     #[serde(default = "default_use_flash_attn")]
     pub use_flash_attn: bool,
+    /// MoE block (e.g. gemma-4-26B-A4B-it): each layer adds a routed
+    /// mixture-of-experts branch alongside the dense MLP.
+    #[serde(default)]
+    pub enable_moe_block: bool,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub top_k_experts: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    /// Global (full-attention) layers share the K projection for V — the
+    /// checkpoint has no v_proj on those layers (e.g. gemma-4-26B-A4B-it).
+    #[serde(default)]
+    pub attention_k_eq_v: bool,
 }
 
 impl Gemma4TextConfig {
@@ -144,6 +158,16 @@ impl Gemma4TextConfig {
             .and_then(|rp| rp.sliding_attention.as_ref())
             .and_then(|sa| sa.rope_theta)
             .unwrap_or(10000.0)
+    }
+
+    /// Base frequency for global (full-attention) layers: rope_parameters
+    /// takes precedence over the legacy top-level rope_theta.
+    pub fn rope_global_base_freq(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|rp| rp.full_attention.as_ref())
+            .and_then(|fa| fa.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 
     pub fn is_sliding(&self, layer_idx: usize) -> bool {

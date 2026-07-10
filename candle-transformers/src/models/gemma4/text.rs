@@ -248,6 +248,165 @@ impl Module for MLP {
     }
 }
 
+// ── MoE (router + packed experts) ───────────────────────────────────────────
+
+/// Token router: weightless RMS norm → learned scale (× hidden^-0.5) → linear
+/// to expert logits → f32 softmax → top-k (renormalized, then multiplied by a
+/// learned per-expert scale). Routing decisions are computed on the host —
+/// [tokens, num_experts] is tiny and the expert dispatch needs host-side
+/// grouping anyway.
+#[derive(Debug, Clone)]
+struct Router {
+    proj: Proj,
+    scale: Tensor,
+    per_expert_scale: Vec<f32>,
+    top_k: usize,
+    scalar_root: f64,
+    eps: f64,
+}
+
+/// Per-token routing decision: (expert index, combine weight).
+type RoutingPlan = Vec<Vec<(usize, f32)>>;
+
+impl Router {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        let proj = Proj::new(cfg.hidden_size, cfg.num_experts, false, vb.pp("proj"), quant)?;
+        let scale = vb.get(cfg.hidden_size, "scale")?;
+        let per_expert_scale = vb
+            .get(cfg.num_experts, "per_expert_scale")?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        Ok(Self {
+            proj,
+            scale,
+            per_expert_scale,
+            top_k: cfg.top_k_experts,
+            scalar_root: (cfg.hidden_size as f64).sqrt().recip(),
+            eps: cfg.rms_norm_eps,
+        })
+    }
+
+    /// `xs_flat`: [tokens, hidden] (the pre-feedforward residual stream).
+    fn route(&self, xs_flat: &Tensor) -> Result<RoutingPlan> {
+        let xs = v_norm(xs_flat, self.eps)?; // weightless RMS norm
+        let xs = xs.broadcast_mul(&self.scale)?;
+        let xs = (xs * self.scalar_root)?;
+        let logits = self.proj.forward(&xs)?.to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+        let probs = probs.to_vec2::<f32>()?;
+
+        let mut plan = Vec::with_capacity(probs.len());
+        for row in probs {
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+            idx.truncate(self.top_k);
+            let sum: f32 = idx.iter().map(|&e| row[e]).sum();
+            plan.push(
+                idx.into_iter()
+                    .map(|e| (e, row[e] / sum * self.per_expert_scale[e]))
+                    .collect(),
+            );
+        }
+        Ok(plan)
+    }
+}
+
+/// Expert FFN weights, stored packed as in the checkpoint:
+/// `gate_up_proj` [E, 2*moe_intermediate, hidden], `down_proj`
+/// [E, hidden, moe_intermediate]. With `quant` each expert slice is
+/// quantized separately at load time.
+#[derive(Debug, Clone)]
+enum ExpertWeights {
+    Plain { gate_up: Tensor, down: Tensor },
+    Quant {
+        gate_up: Vec<QMatMul>,
+        down: Vec<QMatMul>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct Experts {
+    weights: ExpertWeights,
+    act_fn: Activation,
+}
+
+impl Experts {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        let e = cfg.num_experts;
+        let inter = cfg.moe_intermediate_size;
+        let h = cfg.hidden_size;
+        // Raw parameters — no ".weight" suffix in the checkpoint.
+        let gate_up = vb.get((e, 2 * inter, h), "gate_up_proj")?;
+        let down = vb.get((e, h, inter), "down_proj")?;
+        let weights = match quant {
+            None => ExpertWeights::Plain { gate_up, down },
+            Some(dtype) => {
+                let mut gu = Vec::with_capacity(e);
+                let mut dn = Vec::with_capacity(e);
+                for i in 0..e {
+                    let g = gate_up.i(i)?.to_dtype(DType::F32)?.contiguous()?;
+                    gu.push(QMatMul::from_qtensor(QTensor::quantize(&g, dtype)?)?);
+                    let d = down.i(i)?.to_dtype(DType::F32)?.contiguous()?;
+                    dn.push(QMatMul::from_qtensor(QTensor::quantize(&d, dtype)?)?);
+                }
+                ExpertWeights::Quant { gate_up: gu, down: dn }
+            }
+        };
+        Ok(Self {
+            weights,
+            act_fn: cfg.hidden_activation,
+        })
+    }
+
+    fn expert_forward(&self, expert: usize, xs: &Tensor) -> Result<Tensor> {
+        let gate_up = match &self.weights {
+            ExpertWeights::Plain { gate_up, .. } => {
+                xs.matmul(&gate_up.i(expert)?.t()?.contiguous()?)?
+            }
+            ExpertWeights::Quant { gate_up, .. } => gate_up[expert].forward(xs)?,
+        };
+        let chunks = gate_up.chunk(2, D::Minus1)?;
+        let hidden = (chunks[0].apply(&self.act_fn)? * &chunks[1])?;
+        match &self.weights {
+            ExpertWeights::Plain { down, .. } => {
+                hidden.matmul(&down.i(expert)?.t()?.contiguous()?)
+            }
+            ExpertWeights::Quant { down, .. } => down[expert].forward(&hidden),
+        }
+    }
+
+    /// `xs_flat`: [tokens, hidden] (already normalized). Groups tokens by
+    /// expert, runs each hit expert once, and combines weighted outputs.
+    fn forward(&self, xs_flat: &Tensor, plan: &RoutingPlan) -> Result<Tensor> {
+        let device = xs_flat.device();
+        let dtype = xs_flat.dtype();
+
+        // expert -> (token indices, combine weights)
+        let mut by_expert: std::collections::HashMap<usize, (Vec<u32>, Vec<f32>)> =
+            std::collections::HashMap::new();
+        for (tok, choices) in plan.iter().enumerate() {
+            for &(e, w) in choices {
+                let entry = by_expert.entry(e).or_default();
+                entry.0.push(tok as u32);
+                entry.1.push(w);
+            }
+        }
+
+        let mut out = Tensor::zeros(xs_flat.shape(), dtype, device)?;
+        let mut experts: Vec<_> = by_expert.into_iter().collect();
+        experts.sort_unstable_by_key(|(e, _)| *e);
+        for (expert, (toks, ws)) in experts {
+            let idx = Tensor::from_vec(toks, (ws.len(),), device)?;
+            let xs_e = xs_flat.index_select(&idx, 0)?;
+            let ys = self.expert_forward(expert, &xs_e)?;
+            let w = Tensor::from_vec(ws, (ys.dim(0)?, 1), device)?.to_dtype(dtype)?;
+            let ys = ys.broadcast_mul(&w)?;
+            out = out.index_add(&idx, &ys, 0)?;
+        }
+        Ok(out)
+    }
+}
+
 // ── Flash attention ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "flash-attn")]
@@ -349,10 +508,26 @@ impl Attention {
                 .rposition(|t| t == layer_type)
                 == Some(layer_idx);
 
+        // K==V ("alternative attention", e.g. gemma-4-26B-A4B-it): global
+        // layers have no v_proj tensor; V reuses the raw K projection (the
+        // norms diverge afterwards: K gets k_norm+RoPE, V only the unscaled
+        // v_norm).
+        let k_eq_v = cfg.attention_k_eq_v && !is_sliding;
         let q_proj = Proj::new(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"), quant)?;
         let (k_proj, v_proj, k_norm) = if is_kv_shared {
             (None, None, None)
         } else {
+            let v_proj = if k_eq_v {
+                None
+            } else {
+                Some(Proj::new(
+                    hidden_sz,
+                    num_kv_heads * head_dim,
+                    bias,
+                    vb.pp("v_proj"),
+                    quant,
+                )?)
+            };
             (
                 Some(Proj::new(
                     hidden_sz,
@@ -361,13 +536,7 @@ impl Attention {
                     vb.pp("k_proj"),
                     quant,
                 )?),
-                Some(Proj::new(
-                    hidden_sz,
-                    num_kv_heads * head_dim,
-                    bias,
-                    vb.pp("v_proj"),
-                    quant,
-                )?),
+                v_proj,
                 Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?),
             )
         };
@@ -445,20 +614,23 @@ impl Attention {
             (q, k.clone(), v.clone())
         } else {
             let k_proj = self.k_proj.as_ref().expect("non-shared layer has k_proj");
-            let v_proj = self.v_proj.as_ref().expect("non-shared layer has v_proj");
             let k_norm = self.k_norm.as_ref().expect("non-shared layer has k_norm");
 
-            let mut k = k_proj.forward(xs)?;
-            let v = v_proj.forward(xs)?;
-            k = k
+            let k_raw = k_proj
+                .forward(xs)?
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            k = k_norm.forward(&k)?;
+            // K==V layers reuse the raw (pre-norm) K projection as V.
+            let v_raw = match self.v_proj.as_ref() {
+                Some(v_proj) => v_proj
+                    .forward(xs)?
+                    .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?,
+                None => k_raw.clone(),
+            };
+            let k = k_norm.forward(&k_raw)?;
             // V norm (RMS without learned weight)
-            let v = v_norm(&v, self.rms_norm_eps)?;
+            let v = v_norm(&v_raw, self.rms_norm_eps)?;
 
             // Apply RoPE
             let (q, k) = if self.is_sliding {
@@ -524,6 +696,60 @@ impl Attention {
     }
 }
 
+// ── MoeBlock (per-layer MoE branch) ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct MoeBlock {
+    router: Router,
+    experts: Experts,
+    /// Normalizes the dense-MLP output before the branch sum.
+    post_feedforward_layernorm_1: RmsNorm,
+    /// Normalizes the expert input (off the raw residual).
+    pre_feedforward_layernorm_2: RmsNorm,
+    /// Normalizes the expert output before the branch sum.
+    post_feedforward_layernorm_2: RmsNorm,
+}
+
+impl MoeBlock {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        Ok(Self {
+            router: Router::new(cfg, vb.pp("router"), quant)?,
+            experts: Experts::new(cfg, vb.pp("experts"), quant)?,
+            post_feedforward_layernorm_1: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm_1"),
+            )?,
+            pre_feedforward_layernorm_2: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("pre_feedforward_layernorm_2"),
+            )?,
+            post_feedforward_layernorm_2: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm_2"),
+            )?,
+        })
+    }
+
+    /// `mlp_out`: dense MLP output. `residual`: the pre-feedforward residual
+    /// stream (router and experts both read it, per the reference model).
+    fn forward(&self, mlp_out: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        let h1 = self.post_feedforward_layernorm_1.forward(mlp_out)?;
+
+        let (b, s, h) = residual.dims3()?;
+        let flat = residual.reshape((b * s, h))?;
+        let plan = self.router.route(&flat)?;
+        let h2 = self.pre_feedforward_layernorm_2.forward(&flat)?;
+        let h2 = self.experts.forward(&h2, &plan)?;
+        let h2 = h2.reshape((b, s, h))?;
+        let h2 = self.post_feedforward_layernorm_2.forward(&h2)?;
+
+        h1 + h2
+    }
+}
+
 // ── DecoderLayer ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -539,6 +765,10 @@ struct DecoderLayer {
     per_layer_input_gate: Option<Proj>,
     per_layer_projection: Option<Proj>,
     post_per_layer_input_norm: Option<RmsNorm>,
+    // MoE branch, present when cfg.enable_moe_block (e.g. gemma-4-26B-A4B-it):
+    // dense MLP and routed experts run in parallel off the same residual and
+    // their (separately normalized) outputs are summed.
+    moe: Option<MoeBlock>,
     act_fn: candle_nn::Activation,
     /// Learned scalar applied to the layer output (1.0 when absent).
     layer_scalar: f64,
@@ -632,6 +862,12 @@ impl DecoderLayer {
             .and_then(|t| t.to_vec1::<f32>().ok())
             .map_or(1.0, |v| v[0] as f64);
 
+        let moe = if cfg.enable_moe_block {
+            Some(MoeBlock::new(cfg, vb.clone(), quant)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             self_attn,
             mlp,
@@ -642,6 +878,7 @@ impl DecoderLayer {
             per_layer_input_gate,
             per_layer_projection,
             post_per_layer_input_norm,
+            moe,
             act_fn: cfg.hidden_activation,
             layer_scalar,
             is_sliding,
@@ -671,6 +908,12 @@ impl DecoderLayer {
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
+        // MoE models sum the (normalized) dense and expert branches before the
+        // shared post-feedforward norm; router/experts read the raw residual.
+        let xs = match self.moe.as_ref() {
+            Some(moe) => moe.forward(&xs, residual)?,
+            None => xs,
+        };
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
         let mut xs = (residual + xs)?;
 
@@ -985,5 +1228,85 @@ impl TextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tiny gemma-4-26B-A4B-style config: MoE on every layer, K==V global
+    /// attention, distinct global head geometry. Zero-initialized weights —
+    /// this validates shapes, tensor-name wiring, routing dispatch and both
+    /// attention variants, not numerics.
+    fn moe_test_config() -> Gemma4TextConfig {
+        serde_json::from_str(
+            r#"{
+              "attention_k_eq_v": true,
+              "enable_moe_block": true,
+              "num_experts": 4,
+              "top_k_experts": 2,
+              "moe_intermediate_size": 8,
+              "hidden_size": 32,
+              "intermediate_size": 16,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "num_global_key_value_heads": 1,
+              "head_dim": 8,
+              "global_head_dim": 16,
+              "num_hidden_layers": 3,
+              "layer_types": ["sliding_attention", "sliding_attention", "full_attention"],
+              "sliding_window": 4,
+              "max_position_embeddings": 64,
+              "vocab_size": 64,
+              "final_logit_softcapping": 30.0,
+              "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+              }
+            }"#,
+        )
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn moe_k_eq_v_forward_shapes() -> Result<()> {
+        let dev = Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let cfg = moe_test_config();
+        let mut model = TextModel::new(&cfg, vb)?;
+
+        // Prefill 5 tokens, then decode 1 with offset — exercises both mask
+        // paths, the rotating (sliding) and normal (global) KV caches, the
+        // K==V global layer and the MoE dispatch.
+        let ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &dev)?;
+        let logits = model.forward(&ids, 0)?;
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+        let ids = Tensor::new(&[[6u32]], &dev)?;
+        let logits = model.forward(&ids, 5)?;
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+        let v = logits.flatten_all()?.to_vec1::<f32>()?;
+        assert!(v.iter().all(|x| x.is_finite()), "logits must be finite");
+        Ok(())
+    }
+
+    #[test]
+    fn moe_quantized_load_path() -> Result<()> {
+        // q8_0 requires the row length to be a multiple of the 32-wide GGML
+        // block; hidden 32 / moe_intermediate 8 don't satisfy that for every
+        // projection, so quantize only shapes that do by using hidden 64.
+        let dev = Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        let mut cfg = moe_test_config();
+        cfg.hidden_size = 64;
+        cfg.moe_intermediate_size = 32;
+        cfg.intermediate_size = 32;
+        let mut model = TextModel::new_with_quant(&cfg, vb, Some(GgmlDType::Q8_0))?;
+        let ids = Tensor::new(&[[1u32, 2, 3]], &dev)?;
+        let logits = model.forward(&ids, 0)?;
+        assert_eq!(logits.dims(), &[1, 1, cfg.vocab_size]);
+        Ok(())
     }
 }
