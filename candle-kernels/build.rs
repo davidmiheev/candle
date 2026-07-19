@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
+    // Track the whole source tree so added/edited kernels retrigger the
+    // PTX generation (previously only 4 files were watched, so new .cu
+    // files silently produced a stale ptx.rs).
+    println!("cargo::rerun-if-changed=src");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");

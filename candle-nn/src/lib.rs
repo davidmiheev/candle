@@ -22,6 +22,7 @@ pub mod conv;
 pub mod cpu_flash_attention;
 pub mod embedding;
 pub mod encoding;
+pub mod fused;
 pub mod func;
 pub mod group_norm;
 pub mod init;
