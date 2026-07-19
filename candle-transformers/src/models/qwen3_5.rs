@@ -1,0 +1,707 @@
+//! Qwen3.5 / Qwen3.6 text decoder (hybrid Gated-DeltaNet + full attention).
+//!
+//! Covers the dense checkpoints (Qwen3.5-0.8B/2B/4B/9B/27B, Qwen3.6-27B) and
+//! carries an experimental MoE FFN variant for the A3B-class checkpoints.
+//! Text stack only — the vision tower of the multimodal repos is skipped.
+//!
+//! STATUS: correctness-first scaffold (session item 4).
+//! - Decode is O(1)-state recurrent (conv window + delta-rule state, f32).
+//! - Prefill is NAIVE: the GDN recurrence is applied token-by-token, so the
+//!   whole forward processes one position at a time. Chunked/parallel
+//!   delta-rule prefill and a fused CUDA step kernel are the follow-ups.
+//! - MTP layer of the 35B-A3B checkpoint is ignored (speculative-decoding
+//!   on-ramp, later).
+//!
+//! Reference semantics were transcribed from the HF `qwen3_5` implementation
+//! via kroggen/qwen3.5-c (structs, weight names, β/decay formulas, gated
+//! attention with `[q|gate]`-packed q_proj, gemma-style `(1+w)` RMS norms).
+
+use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_nn::{Linear, VarBuilder};
+use serde::Deserialize;
+
+fn default_one() -> f64 {
+    1.0
+}
+fn default_conv_kernel() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Qwen35TextConfig {
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub num_hidden_layers: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default = "default_one")]
+    pub partial_rotary_factor: f64,
+    /// "linear_attention" | "full_attention" per layer.
+    pub layer_types: Vec<String>,
+    // Gated DeltaNet dims.
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    #[serde(default = "default_conv_kernel")]
+    pub linear_conv_kernel_dim: usize,
+    // MoE (A3B checkpoints); absent on dense models.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: Option<usize>,
+}
+
+impl Qwen35TextConfig {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+    pub fn rotary_dim(&self) -> usize {
+        ((self.head_dim() as f64) * self.partial_rotary_factor) as usize
+    }
+    fn is_linear(&self, layer: usize) -> bool {
+        self.layer_types
+            .get(layer)
+            .map(|t| t == "linear_attention")
+            .unwrap_or(false)
+    }
+}
+
+// ── Norms ───────────────────────────────────────────────────────────────────
+
+/// Gemma-style RMS norm: `x_hat * (1 + w)`. The `+1` is folded into the
+/// weight at load so the hot path is a plain rms_norm.
+#[derive(Debug, Clone)]
+struct RmsNormPlus1 {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNormPlus1 {
+    fn new(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let w = vb.get(size, "weight")?.to_dtype(DType::F32)?;
+        let weight = (w + 1.0)?;
+        Ok(Self { weight, eps })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let x32 = x.to_dtype(DType::F32)?;
+        let var = x32.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = x32.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        normed.broadcast_mul(&self.weight)?.to_dtype(dt)
+    }
+}
+
+fn l2norm_last(x: &Tensor) -> Result<Tensor> {
+    let n = x.sqr()?.sum_keepdim(D::Minus1)?;
+    x.broadcast_div(&(n + 1e-6)?.sqrt()?)
+}
+
+// ── Rotary (partial) ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Rotary {
+    cos: Tensor, // [max_pos, rot/2] f32
+    sin: Tensor,
+    rot: usize,
+}
+
+impl Rotary {
+    fn new(cfg: &Qwen35TextConfig, device: &Device) -> Result<Self> {
+        let rot = cfg.rotary_dim();
+        let max_pos = 32768usize;
+        let inv: Vec<f32> = (0..rot / 2)
+            .map(|i| (1.0 / cfg.rope_theta.powf(2.0 * i as f64 / rot as f64)) as f32)
+            .collect();
+        let inv = Tensor::from_vec(inv, (1, rot / 2), device)?;
+        let pos: Vec<f32> = (0..max_pos).map(|p| p as f32).collect();
+        let pos = Tensor::from_vec(pos, (max_pos, 1), device)?;
+        let freqs = pos.matmul(&inv)?; // [max_pos, rot/2]
+        Ok(Self {
+            cos: freqs.cos()?,
+            sin: freqs.sin()?,
+            rot,
+        })
+    }
+
+    /// x: [b, heads, seq, head_dim]; rotates the first `rot` dims
+    /// (interleaved pairs, matching the reference), passes the rest through.
+    fn apply(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
+        let (_b, _h, seq, hd) = x.dims4()?;
+        let cos = self.cos.narrow(0, pos, seq)?;
+        let sin = self.sin.narrow(0, pos, seq)?;
+        if self.rot == hd {
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        } else {
+            let xr = x.narrow(D::Minus1, 0, self.rot)?.contiguous()?;
+            let xp = x.narrow(D::Minus1, self.rot, hd - self.rot)?;
+            let xr = candle_nn::rotary_emb::rope_i(&xr, &cos, &sin)?;
+            Tensor::cat(&[xr, xp], D::Minus1)
+        }
+    }
+}
+
+// ── Full attention (gated) ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct FullAttention {
+    q_proj: Linear, // out = heads * head_dim * 2 ([q | gate] per head)
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RmsNormPlus1,
+    k_norm: RmsNormPlus1,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_cache: Option<(Tensor, Tensor)>,
+}
+
+fn linear_no_bias(inp: usize, out: usize, vb: VarBuilder) -> Result<Linear> {
+    let w = vb.get((out, inp), "weight")?;
+    Ok(Linear::new(w, None))
+}
+
+impl FullAttention {
+    fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
+        let h = cfg.hidden_size;
+        let hd = cfg.head_dim();
+        Ok(Self {
+            q_proj: linear_no_bias(h, cfg.num_attention_heads * hd * 2, vb.pp("q_proj"))?,
+            k_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("k_proj"))?,
+            v_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("v_proj"))?,
+            o_proj: linear_no_bias(cfg.num_attention_heads * hd, h, vb.pp("o_proj"))?,
+            q_norm: RmsNormPlus1::new(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
+            k_norm: RmsNormPlus1::new(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
+            n_heads: cfg.num_attention_heads,
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim: hd,
+            kv_cache: None,
+        })
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache = None;
+    }
+
+    /// x: [b, seq, hidden] (naive path is called with seq == 1).
+    fn forward(&mut self, x: &Tensor, rotary: &Rotary, pos: usize) -> Result<Tensor> {
+        let (b, seq, _h) = x.dims3()?;
+        let hd = self.head_dim;
+
+        let qg = self.q_proj.forward(x)?; // [b, seq, heads*hd*2]
+        let qg = qg.reshape((b, seq, self.n_heads, 2, hd))?;
+        let q = qg.i((.., .., .., 0, ..))?; // [b, seq, heads, hd]
+        let gate = qg.i((.., .., .., 1, ..))?;
+
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_kv_heads, hd))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, seq, self.n_kv_heads, hd))?;
+
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        let q = q.transpose(1, 2)?; // [b, heads, seq, hd]
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+        let q = rotary.apply(&q, pos)?;
+        let k = rotary.apply(&k, pos)?.contiguous()?;
+
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((pk, pv)) => (
+                Tensor::cat(&[pk, &k], 2)?.contiguous()?,
+                Tensor::cat(&[pv, &v], 2)?.contiguous()?,
+            ),
+        };
+        self.kv_cache = Some((k.clone(), v.clone()));
+
+        let rep = self.n_heads / self.n_kv_heads;
+        let kx = repeat_kv(&k, rep)?;
+        let vx = repeat_kv(&v, rep)?;
+
+        let scale = 1.0 / (hd as f64).sqrt();
+        let att = (q.matmul(&kx.transpose(2, 3)?)? * scale)?;
+        // seq == 1 in the naive path → no causal mask needed; guard anyway.
+        let att = if seq > 1 {
+            let total = kx.dim(2)?;
+            let mask = causal_mask(seq, total, att.device())?.to_dtype(att.dtype())?;
+            att.broadcast_add(&mask)?
+        } else {
+            att
+        };
+        let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            .to_dtype(q.dtype())?;
+        let out = att.matmul(&vx)?; // [b, heads, seq, hd]
+
+        // Elementwise output gate: attn * sigmoid(gate).
+        let gate = gate.transpose(1, 2)?; // [b, heads, seq, hd]
+        let out = (out * candle_nn::ops::sigmoid(&gate.contiguous()?)?)?;
+
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.n_heads * hd))?;
+        self.o_proj.forward(&out)
+    }
+}
+
+fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
+    if rep == 1 {
+        return Ok(x.clone());
+    }
+    let (b, kvh, s, hd) = x.dims4()?;
+    x.unsqueeze(2)?
+        .expand((b, kvh, rep, s, hd))?
+        .reshape((b, kvh * rep, s, hd))
+}
+
+fn causal_mask(q_len: usize, k_len: usize, device: &Device) -> Result<Tensor> {
+    let offset = k_len - q_len;
+    let mask: Vec<f32> = (0..q_len)
+        .flat_map(|i| {
+            (0..k_len).map(move |j| if j <= i + offset { 0.0 } else { f32::NEG_INFINITY })
+        })
+        .collect();
+    Tensor::from_vec(mask, (1, 1, q_len, k_len), device)
+}
+
+// ── Gated DeltaNet (linear attention) ───────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct GatedDeltaNet {
+    in_proj_qkv: Linear, // [2*key_dim + value_dim, hidden]
+    in_proj_z: Linear,   // [value_dim, hidden]
+    in_proj_b: Linear,   // [n_v_heads, hidden]
+    in_proj_a: Linear,   // [n_v_heads, hidden]
+    conv1d_weight: Tensor, // [conv_dim, kernel] f32 (depthwise)
+    dt_bias: Tensor,     // [n_v_heads] f32
+    neg_a: Tensor,       // [n_v_heads] f32: -exp(A_log)
+    norm_weight: Tensor, // [d_v] f32
+    out_proj: Linear,
+    n_k_heads: usize,
+    n_v_heads: usize,
+    d_k: usize,
+    d_v: usize,
+    conv_kernel: usize,
+    eps: f64,
+    /// Rolling conv input window: [conv_dim, kernel] f32.
+    conv_state: Option<Tensor>,
+    /// Delta-rule state per v-head: [n_v_heads, d_v, d_k] f32
+    /// (readout is `S · q`).
+    s_state: Option<Tensor>,
+}
+
+impl GatedDeltaNet {
+    fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
+        let h = cfg.hidden_size;
+        let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+        let value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let kernel = cfg.linear_conv_kernel_dim;
+
+        // conv1d checkpoint shape is [conv_dim, 1, kernel] (depthwise).
+        let conv_w = vb
+            .pp("conv1d")
+            .get((conv_dim, 1, kernel), "weight")?
+            .reshape((conv_dim, kernel))?
+            .to_dtype(DType::F32)?;
+        let a_log = vb.get(cfg.linear_num_value_heads, "A_log")?.to_dtype(DType::F32)?;
+        let neg_a = a_log.exp()?.neg()?;
+        Ok(Self {
+            in_proj_qkv: linear_no_bias(h, conv_dim, vb.pp("in_proj_qkv"))?,
+            in_proj_z: linear_no_bias(h, value_dim, vb.pp("in_proj_z"))?,
+            in_proj_b: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_b"))?,
+            in_proj_a: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_a"))?,
+            conv1d_weight: conv_w,
+            dt_bias: vb.get(cfg.linear_num_value_heads, "dt_bias")?.to_dtype(DType::F32)?,
+            neg_a,
+            norm_weight: vb.pp("norm").get(cfg.linear_value_head_dim, "weight")?.to_dtype(DType::F32)?,
+            out_proj: linear_no_bias(value_dim, h, vb.pp("out_proj"))?,
+            n_k_heads: cfg.linear_num_key_heads,
+            n_v_heads: cfg.linear_num_value_heads,
+            d_k: cfg.linear_key_head_dim,
+            d_v: cfg.linear_value_head_dim,
+            conv_kernel: kernel,
+            eps: cfg.rms_norm_eps,
+            conv_state: None,
+            s_state: None,
+        })
+    }
+
+    fn clear_state(&mut self) {
+        self.conv_state = None;
+        self.s_state = None;
+    }
+
+    /// Single-token step. x: [b=1, 1, hidden]. All recurrence math in f32.
+    fn forward_step(&mut self, x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let dev = x.device().clone();
+        let key_dim = self.n_k_heads * self.d_k;
+        let value_dim = self.n_v_heads * self.d_v;
+        let conv_dim = 2 * key_dim + value_dim;
+
+        let x_flat = x.reshape((1, ()))?; // [1, hidden]
+        let qkv = self.in_proj_qkv.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, conv_dim]
+        let z = self.in_proj_z.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, value_dim]
+        let b_raw = self.in_proj_b.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, n_v]
+        let a_raw = self.in_proj_a.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, n_v]
+
+        // β = σ(b);   g = -exp(A_log) · softplus(a + dt_bias)
+        let beta = candle_nn::ops::sigmoid(&b_raw)?.reshape(self.n_v_heads)?;
+        let sp = softplus(&a_raw.reshape(self.n_v_heads)?.broadcast_add(&self.dt_bias)?)?;
+        let g = (sp * &self.neg_a)?; // [n_v]
+        let decay = g.exp()?; // per-head multiplicative state decay ∈ (0, 1)
+
+        // Rolling depthwise conv window + SiLU.
+        let qkv_col = qkv.reshape((conv_dim, 1))?;
+        let window = match &self.conv_state {
+            Some(prev) => Tensor::cat(&[&prev.narrow(1, 1, self.conv_kernel - 1)?, &qkv_col], 1)?,
+            None => {
+                let zeros =
+                    Tensor::zeros((conv_dim, self.conv_kernel - 1), DType::F32, &dev)?;
+                Tensor::cat(&[&zeros, &qkv_col], 1)?
+            }
+        };
+        self.conv_state = Some(window.clone());
+        let conved = (window * &self.conv1d_weight)?.sum(1)?; // [conv_dim]
+        let conved = silu_f32(&conved)?;
+
+        let q = conved.narrow(0, 0, key_dim)?.reshape((self.n_k_heads, self.d_k))?;
+        let k = conved
+            .narrow(0, key_dim, key_dim)?
+            .reshape((self.n_k_heads, self.d_k))?;
+        let v = conved
+            .narrow(0, 2 * key_dim, value_dim)?
+            .reshape((self.n_v_heads, self.d_v))?;
+        // L2 norm on q, k per head.
+        let q = l2norm_last(&q)?;
+        let k = l2norm_last(&k)?;
+        // Broadcast k/q heads to v heads (grouped: n_v / n_k values per key head).
+        let group = self.n_v_heads / self.n_k_heads;
+        let q = expand_heads(&q, group)?; // [n_v, d_k]
+        let k = expand_heads(&k, group)?; // [n_v, d_k]
+
+        // Delta rule (per v-head, S: [d_v, d_k]):
+        //   S ← decay · S
+        //   pred = S · k                  [d_v]
+        //   S ← S + β · (v − pred) ⊗ k
+        //   o = S · q                     [d_v]
+        let s = match &self.s_state {
+            Some(s) => s.clone(),
+            None => Tensor::zeros((self.n_v_heads, self.d_v, self.d_k), DType::F32, &dev)?,
+        };
+        let s = s.broadcast_mul(&decay.reshape((self.n_v_heads, 1, 1))?)?;
+        let k3 = k.reshape((self.n_v_heads, self.d_k, 1))?;
+        let pred = s.matmul(&k3)?.squeeze(2)?; // [n_v, d_v]
+        let err = (v - pred)?; // [n_v, d_v]
+        let err = err.broadcast_mul(&beta.reshape((self.n_v_heads, 1))?)?;
+        let outer = err
+            .reshape((self.n_v_heads, self.d_v, 1))?
+            .matmul(&k.reshape((self.n_v_heads, 1, self.d_k))?)?;
+        let s = (s + outer)?;
+        self.s_state = Some(s.clone());
+        let q3 = q.reshape((self.n_v_heads, self.d_k, 1))?;
+        let o = s.matmul(&q3)?.squeeze(2)?; // [n_v, d_v]
+
+        // Gated per-head RMS norm: w * x̂ * silu(z).
+        let var = o.sqr()?.mean_keepdim(D::Minus1)?;
+        let o = o.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        let o = o.broadcast_mul(&self.norm_weight.reshape((1, self.d_v))?)?;
+        let zg = silu_f32(&z.reshape((self.n_v_heads, self.d_v))?)?;
+        let o = (o * zg)?;
+
+        let o = o.reshape((1, 1, value_dim))?.to_dtype(dt)?;
+        self.out_proj.forward(&o)
+    }
+}
+
+fn expand_heads(x: &Tensor, group: usize) -> Result<Tensor> {
+    if group == 1 {
+        return Ok(x.clone());
+    }
+    let (h, d) = x.dims2()?;
+    x.unsqueeze(1)?.expand((h, group, d))?.reshape((h * group, d))
+}
+
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    (x.exp()? + 1.0)?.log()
+}
+
+fn silu_f32(x: &Tensor) -> Result<Tensor> {
+    x * candle_nn::ops::sigmoid(x)?
+}
+
+// ── MLP (dense) / MoE (experimental) ────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl Mlp {
+    fn new(h: usize, inter: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            gate_proj: linear_no_bias(h, inter, vb.pp("gate_proj"))?,
+            up_proj: linear_no_bias(h, inter, vb.pp("up_proj"))?,
+            down_proj: linear_no_bias(inter, h, vb.pp("down_proj"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let g = self.gate_proj.forward(x)?.silu()?;
+        let u = self.up_proj.forward(x)?;
+        self.down_proj.forward(&(g * u)?)
+    }
+}
+
+/// Experimental sparse MoE FFN for the A3B checkpoints (qwen3_moe-style:
+/// softmax router over `num_experts`, top-k renormalized, plus an
+/// always-on shared expert). Naive per-expert loop — port to the fused
+/// indexed-MoE kernel once validated.
+#[derive(Debug, Clone)]
+struct SparseMoe {
+    gate: Linear, // router [num_experts, hidden]
+    experts: Vec<Mlp>,
+    shared_expert: Option<Mlp>,
+    shared_expert_gate: Option<Linear>,
+    top_k: usize,
+}
+
+impl SparseMoe {
+    fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
+        let h = cfg.hidden_size;
+        let e = cfg.num_experts.unwrap_or(0);
+        let inter = cfg.moe_intermediate_size.unwrap_or(cfg.intermediate_size);
+        let mut experts = Vec::with_capacity(e);
+        for i in 0..e {
+            experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
+        }
+        let (shared_expert, shared_expert_gate) =
+            match cfg.shared_expert_intermediate_size {
+                Some(si) if si > 0 => (
+                    Some(Mlp::new(h, si, vb.pp("shared_expert"))?),
+                    Some(linear_no_bias(h, 1, vb.pp("shared_expert_gate"))?),
+                ),
+                _ => (None, None),
+            };
+        Ok(Self {
+            gate: linear_no_bias(h, e, vb.pp("gate"))?,
+            experts,
+            shared_expert,
+            shared_expert_gate,
+            top_k: cfg.num_experts_per_tok.unwrap_or(8),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Naive single-token routing (b=1, seq=1 in the scaffold path).
+        let (b, s, h) = x.dims3()?;
+        let flat = x.reshape((b * s, h))?;
+        let logits = self.gate.forward(&flat)?.to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+        let probs_v = probs.to_vec2::<f32>()?;
+        let mut rows = Vec::with_capacity(b * s);
+        for (t, row) in probs_v.iter().enumerate() {
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_unstable_by(|&a, &c| row[c].total_cmp(&row[a]));
+            idx.truncate(self.top_k);
+            let denom: f32 = idx.iter().map(|&e| row[e]).sum();
+            let xt = flat.narrow(0, t, 1)?;
+            let mut acc: Option<Tensor> = None;
+            for &e in &idx {
+                let w = row[e] / denom;
+                let y = (self.experts[e].forward(&xt)? * w as f64)?;
+                acc = Some(match acc {
+                    None => y,
+                    Some(a) => (a + y)?,
+                });
+            }
+            rows.push(acc.expect("top_k >= 1"));
+        }
+        let out = Tensor::cat(&rows, 0)?;
+        let mut out = out.reshape((b, s, h))?;
+        if let (Some(se), Some(sg)) = (&self.shared_expert, &self.shared_expert_gate) {
+            let gate = candle_nn::ops::sigmoid(&sg.forward(x)?.to_dtype(DType::F32)?)?
+                .to_dtype(x.dtype())?;
+            let sh = se.forward(x)?.broadcast_mul(&gate)?;
+            out = (out + sh)?;
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Ffn {
+    Dense(Mlp),
+    Moe(SparseMoe),
+}
+
+impl Ffn {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Ffn::Dense(m) => m.forward(x),
+            Ffn::Moe(m) => m.forward(x),
+        }
+    }
+}
+
+// ── Decoder layer / model ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum Mixer {
+    Full(FullAttention),
+    Linear(GatedDeltaNet),
+}
+
+#[derive(Debug, Clone)]
+struct DecoderLayer {
+    mixer: Mixer,
+    ffn: Ffn,
+    input_layernorm: RmsNormPlus1,
+    post_attention_layernorm: RmsNormPlus1,
+}
+
+impl DecoderLayer {
+    fn new(cfg: &Qwen35TextConfig, layer: usize, vb: VarBuilder) -> Result<Self> {
+        let mixer = if cfg.is_linear(layer) {
+            Mixer::Linear(GatedDeltaNet::new(cfg, vb.pp("linear_attn"))?)
+        } else {
+            Mixer::Full(FullAttention::new(cfg, vb.pp("self_attn"))?)
+        };
+        let ffn = if cfg.num_experts.unwrap_or(0) > 0 {
+            Ffn::Moe(SparseMoe::new(cfg, vb.pp("mlp"))?)
+        } else {
+            Ffn::Dense(Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?)
+        };
+        Ok(Self {
+            mixer,
+            ffn,
+            input_layernorm: RmsNormPlus1::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("input_layernorm"),
+            )?,
+            post_attention_layernorm: RmsNormPlus1::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_attention_layernorm"),
+            )?,
+        })
+    }
+
+    fn forward_step(&mut self, x: &Tensor, rotary: &Rotary, pos: usize) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let mixed = match &mut self.mixer {
+            Mixer::Full(a) => a.forward(&normed, rotary, pos)?,
+            Mixer::Linear(g) => g.forward_step(&normed)?,
+        };
+        let x = (x + mixed)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let f = self.ffn.forward(&normed)?;
+        x + f
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Model {
+    embed_tokens: candle_nn::Embedding,
+    layers: Vec<DecoderLayer>,
+    norm: RmsNormPlus1,
+    lm_head: Linear,
+    rotary: Rotary,
+    device: Device,
+    /// Absolute position of the next token (recurrent state cursor).
+    pos: usize,
+}
+
+impl Model {
+    pub fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
+        // Multimodal checkpoints prefix the text stack with `language_model`.
+        let root = if vb.contains_tensor("model.language_model.embed_tokens.weight") {
+            vb.pp("model").pp("language_model")
+        } else {
+            vb.pp("model")
+        };
+        let embed_tokens = candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            root.pp("embed_tokens"),
+        )?;
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let vb_l = root.pp("layers");
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(DecoderLayer::new(cfg, i, vb_l.pp(i))?);
+        }
+        let norm = RmsNormPlus1::new(cfg.hidden_size, cfg.rms_norm_eps, root.pp("norm"))?;
+        let lm_head = if cfg.tie_word_embeddings {
+            Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
+        let rotary = Rotary::new(cfg, vb.device())?;
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            rotary,
+            device: vb.device().clone(),
+            pos: 0,
+        })
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for l in self.layers.iter_mut() {
+            match &mut l.mixer {
+                Mixer::Full(a) => a.clear_kv_cache(),
+                Mixer::Linear(g) => g.clear_state(),
+            }
+        }
+        self.pos = 0;
+    }
+
+    /// Executor-compatible forward. NAIVE: iterates the input positions one
+    /// at a time (the GDN recurrence is sequential in this scaffold), and
+    /// returns lm_head logits of the final position only: [1, 1, vocab].
+    pub fn forward(&mut self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
+        if start_pos == 0 && self.pos != 0 {
+            self.clear_kv_cache();
+        }
+        let (_b, seq) = input.dims2()?;
+        let mut last: Option<Tensor> = None;
+        for t in 0..seq {
+            let tok = input.narrow(1, t, 1)?;
+            let mut x = self.embed_tokens.forward(&tok)?; // [1, 1, hidden]
+            let pos = self.pos;
+            for layer in self.layers.iter_mut() {
+                x = layer.forward_step(&x, &self.rotary, pos)?;
+            }
+            self.pos += 1;
+            last = Some(x);
+        }
+        let x = last.ok_or_else(|| candle::Error::Msg("empty input".into()))?;
+        let x = self.norm.forward(&x)?;
+        self.lm_head.forward(&x)
+    }
+}
