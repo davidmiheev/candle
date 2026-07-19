@@ -870,6 +870,23 @@ impl QCudaStorage {
             [b, _k] => *b <= max_bm,
             _ => false,
         };
+        // The legacy dequantize fallback only understands F32/F16 inputs;
+        // convert BF16 activations (and convert the result back).
+        use crate::backend::BackendStorage as _;
+        if storage.dtype() == crate::DType::BF16 {
+            let cast_layout =
+                crate::Layout::contiguous_with_offset(layout.shape(), layout.start_offset());
+            let storage_f32 = storage.to_dtype(&cast_layout, crate::DType::F32)?;
+            let f32_layout = crate::Layout::contiguous(layout.shape());
+            let (out, out_shape) = if use_vec_kernel {
+                self.dequantize_matmul_vec(self_shape, &storage_f32, &f32_layout)?
+            } else {
+                self.dequantize_matmul(self_shape, &storage_f32, &f32_layout)?
+            };
+            let out_layout = crate::Layout::contiguous(&out_shape);
+            let out = out.to_dtype(&out_layout, crate::DType::BF16)?;
+            return Ok((out, out_shape));
+        }
         if use_vec_kernel {
             self.dequantize_matmul_vec(self_shape, storage, layout)
         } else {
