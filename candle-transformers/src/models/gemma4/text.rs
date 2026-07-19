@@ -37,10 +37,19 @@ impl Proj {
         match quant {
             None => Ok(Self::Plain(linear_bias(in_dim, out_dim, bias, vb)?)),
             Some(dtype) => {
-                let weight = vb
-                    .get((out_dim, in_dim), "weight")?
-                    .to_dtype(DType::F32)?;
-                let weight = QMatMul::from_qtensor(QTensor::quantize(&weight, dtype)?)?;
+                // K-quants require the reduction dim % 256 == 0.
+                let dtype = moe_quant_dtype_for(in_dim, dtype);
+                let dev = vb.device().clone();
+                let weight = vb.get((out_dim, in_dim), "weight")?;
+                // Quantize via the CPU: avoids an f32 copy of the full weight
+                // on the GPU (the tied lm_head alone is ~3 GB in f32).
+                let weight = if dev.is_cuda() {
+                    let cpu = weight.to_device(&Device::Cpu)?;
+                    QTensor::quantize_onto(&cpu, dtype, &dev)?
+                } else {
+                    QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?
+                };
+                let weight = QMatMul::from_qtensor(weight)?;
                 let bias = if bias {
                     Some(vb.get(out_dim, "bias")?.to_dtype(DType::F32)?)
                 } else {
@@ -317,11 +326,34 @@ impl Router {
 /// quantized separately at load time.
 #[derive(Debug, Clone)]
 enum ExpertWeights {
-    Plain { gate_up: Tensor, down: Tensor },
+    /// Dense experts, stored PRE-TRANSPOSED ([E, hidden, 2*inter] /
+    /// [E, inter, hidden]) so per-token expert matmuls need no copy.
+    Plain { gate_up_t: Tensor, down_t: Tensor },
+    /// Legacy per-expert quantized matmuls (CPU / non-CUDA fallback).
     Quant {
         gate_up: Vec<QMatMul>,
         down: Vec<QMatMul>,
     },
+    /// All experts stacked in single QTensors ([E, n, k]); dispatched with
+    /// one fused indexed-MoE CUDA kernel per projection.
+    QuantFused {
+        gate_up: Arc<QTensor>,
+        down: Arc<QTensor>,
+    },
+}
+
+/// K-quants need the reduction dim to be a multiple of 256; fall back to a
+/// 32-block dtype supported by the fused indexed-MoE kernel otherwise.
+fn moe_quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
+    let needs_256 = matches!(
+        requested,
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+    );
+    if needs_256 && k % 256 != 0 {
+        GgmlDType::Q8_0
+    } else {
+        requested
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -336,11 +368,42 @@ impl Experts {
         let inter = cfg.moe_intermediate_size;
         let h = cfg.hidden_size;
         // Raw parameters — no ".weight" suffix in the checkpoint.
-        let gate_up = vb.get((e, 2 * inter, h), "gate_up_proj")?;
-        let down = vb.get((e, h, inter), "down_proj")?;
         let weights = match quant {
-            None => ExpertWeights::Plain { gate_up, down },
+            None => {
+                // Pre-transpose once at load: expert_forward then reads a
+                // contiguous slice instead of materializing a transposed
+                // copy of the expert weights on every token.
+                let gate_up = vb.get((e, 2 * inter, h), "gate_up_proj")?;
+                let down = vb.get((e, h, inter), "down_proj")?;
+                let gate_up_t = gate_up.transpose(1, 2)?.contiguous()?;
+                let down_t = down.transpose(1, 2)?.contiguous()?;
+                ExpertWeights::Plain { gate_up_t, down_t }
+            }
+            Some(dtype) if vb.device().is_cuda() => {
+                // Quantize on the CPU and upload only the quantized bytes:
+                // avoids multi-GB f32 transients on the GPU during load.
+                // One projection at a time keeps the peak small.
+                let dev = vb.device().clone();
+                let gu_dtype = moe_quant_dtype_for(h, dtype);
+                let dn_dtype = moe_quant_dtype_for(inter, dtype);
+                let gu = {
+                    let t = vb
+                        .get((e, 2 * inter, h), "gate_up_proj")?
+                        .to_device(&Device::Cpu)?;
+                    QTensor::quantize_onto(&t, gu_dtype, &dev)?
+                };
+                let dn = {
+                    let t = vb.get((e, h, inter), "down_proj")?.to_device(&Device::Cpu)?;
+                    QTensor::quantize_onto(&t, dn_dtype, &dev)?
+                };
+                ExpertWeights::QuantFused {
+                    gate_up: Arc::new(gu),
+                    down: Arc::new(dn),
+                }
+            }
             Some(dtype) => {
+                let gate_up = vb.get((e, 2 * inter, h), "gate_up_proj")?;
+                let down = vb.get((e, h, inter), "down_proj")?;
                 let mut gu = Vec::with_capacity(e);
                 let mut dn = Vec::with_capacity(e);
                 for i in 0..e {
@@ -360,24 +423,60 @@ impl Experts {
 
     fn expert_forward(&self, expert: usize, xs: &Tensor) -> Result<Tensor> {
         let gate_up = match &self.weights {
-            ExpertWeights::Plain { gate_up, .. } => {
-                xs.matmul(&gate_up.i(expert)?.t()?.contiguous()?)?
-            }
+            ExpertWeights::Plain { gate_up_t, .. } => xs.matmul(&gate_up_t.i(expert)?)?,
             ExpertWeights::Quant { gate_up, .. } => gate_up[expert].forward(xs)?,
+            ExpertWeights::QuantFused { .. } => unreachable!("fused path handled in forward"),
         };
         let chunks = gate_up.chunk(2, D::Minus1)?;
         let hidden = (chunks[0].apply(&self.act_fn)? * &chunks[1])?;
         match &self.weights {
-            ExpertWeights::Plain { down, .. } => {
-                hidden.matmul(&down.i(expert)?.t()?.contiguous()?)
-            }
+            ExpertWeights::Plain { down_t, .. } => hidden.matmul(&down_t.i(expert)?),
             ExpertWeights::Quant { down, .. } => down[expert].forward(&hidden),
+            ExpertWeights::QuantFused { .. } => unreachable!("fused path handled in forward"),
         }
+    }
+
+    /// Fused CUDA path: one indexed-MoE kernel per projection, all selected
+    /// experts of all tokens in a single launch.
+    fn forward_fused(
+        &self,
+        xs_flat: &Tensor,
+        plan: &RoutingPlan,
+        gate_up: &QTensor,
+        down: &QTensor,
+    ) -> Result<Tensor> {
+        let device = xs_flat.device();
+        let out_dtype = xs_flat.dtype();
+        let (tokens, hidden) = xs_flat.dims2()?;
+        let topk = plan.first().map(|c| c.len()).unwrap_or(0);
+
+        let mut ids = Vec::with_capacity(tokens * topk);
+        let mut ws = Vec::with_capacity(tokens * topk);
+        for choices in plan.iter() {
+            for &(e, w) in choices {
+                ids.push(e as u32);
+                ws.push(w);
+            }
+        }
+        let ids_t = Tensor::from_vec(ids, (tokens, topk), device)?;
+
+        let x32 = xs_flat.to_dtype(DType::F32)?.reshape((tokens, 1, hidden))?;
+        let gu = gate_up.indexed_moe_forward(&x32, &ids_t)?; // [tokens, topk, 2*inter]
+        let chunks = gu.chunk(2, D::Minus1)?;
+        let hidden_act = (chunks[0].apply(&self.act_fn)? * &chunks[1])?;
+        let dn = down.indexed_moe_forward(&hidden_act.contiguous()?, &ids_t)?; // [tokens, topk, hidden]
+
+        let w_t = Tensor::from_vec(ws, (tokens, topk, 1), device)?;
+        let out = dn.broadcast_mul(&w_t)?.sum(1)?; // [tokens, hidden]
+        out.to_dtype(out_dtype)
     }
 
     /// `xs_flat`: [tokens, hidden] (already normalized). Groups tokens by
     /// expert, runs each hit expert once, and combines weighted outputs.
     fn forward(&self, xs_flat: &Tensor, plan: &RoutingPlan) -> Result<Tensor> {
+        if let ExpertWeights::QuantFused { gate_up, down } = &self.weights {
+            return self.forward_fused(xs_flat, plan, gate_up, down);
+        }
         let device = xs_flat.device();
         let dtype = xs_flat.dtype();
 
@@ -1064,9 +1163,15 @@ impl TextModel {
                 // Tied head: quantize a copy of the embedding table rather
                 // than matmul against the F16 gather table.
                 Some(dtype) => {
-                    let weight = embed_tokens.embeddings().to_dtype(DType::F32)?;
+                    let emb = embed_tokens.embeddings();
+                    let q = if emb.device().is_cuda() {
+                        let cpu = emb.to_device(&Device::Cpu)?;
+                        QTensor::quantize_onto(&cpu, dtype, emb.device())?
+                    } else {
+                        QTensor::quantize(&emb.to_dtype(DType::F32)?, dtype)?
+                    };
                     Proj::Quant {
-                        weight: QMatMul::from_qtensor(QTensor::quantize(&weight, dtype)?)?,
+                        weight: QMatMul::from_qtensor(q)?,
                         bias: None,
                     }
                 }
