@@ -10,6 +10,105 @@ use candle_nn::{linear_b as linear_bias, Activation, Linear, VarBuilder};
 
 use super::config::Gemma4TextConfig;
 
+// ── Quantized-weight disk cache ─────────────────────────────────────────────
+//
+// Quantize-on-load of large checkpoints costs minutes (CPU quantize + full
+// safetensors read). When `GEMMA4_QCACHE_FILE` is set, quantized tensors are
+// served from / persisted to a standard GGUF file next to the model assets:
+// the second load skips both the bf16 reads and the quantization entirely.
+pub mod qcache {
+    use candle::quantized::{gguf_file, QTensor};
+    use candle::{Device, Result};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    struct State {
+        path: std::path::PathBuf,
+        reader: Option<(gguf_file::Content, std::fs::File)>,
+        pending: Vec<(String, Arc<QTensor>)>,
+    }
+
+    static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
+
+    fn state() -> &'static Mutex<Option<State>> {
+        STATE.get_or_init(|| {
+            let st = std::env::var("GEMMA4_QCACHE_FILE").ok().map(|p| {
+                let path = std::path::PathBuf::from(p);
+                let reader = std::fs::File::open(&path).ok().and_then(|mut f| {
+                    match gguf_file::Content::read(&mut f) {
+                        Ok(c) => {
+                            eprintln!(
+                                "[gemma4-qcache] using cache {} ({} tensors)",
+                                path.display(),
+                                c.tensor_infos.len()
+                            );
+                            Some((c, f))
+                        }
+                        Err(e) => {
+                            eprintln!("[gemma4-qcache] unreadable cache ({e}), rebuilding");
+                            None
+                        }
+                    }
+                });
+                State { path, reader, pending: Vec::new() }
+            });
+            Mutex::new(st)
+        })
+    }
+
+    /// Fetch a cached quantized tensor straight onto `device`.
+    pub fn get(name: &str, device: &Device) -> Option<QTensor> {
+        let mut guard = state().lock().unwrap_or_else(|p| p.into_inner());
+        let st = guard.as_mut()?;
+        let (content, file) = st.reader.as_mut()?;
+        if !content.tensor_infos.contains_key(name) {
+            return None;
+        }
+        content.tensor(file, name, device).ok()
+    }
+
+    /// Record a freshly quantized tensor for persistence (no-op when the
+    /// cache file already exists or caching is disabled).
+    pub fn put(name: &str, qt: &Arc<QTensor>) {
+        let mut guard = state().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(st) = guard.as_mut() {
+            if st.reader.is_none() {
+                st.pending.push((name.to_string(), qt.clone()));
+            }
+        }
+    }
+
+    /// Write all pending tensors as a GGUF file (called once after load).
+    pub fn flush() -> Result<()> {
+        let mut guard = state().lock().unwrap_or_else(|p| p.into_inner());
+        let st = match guard.as_mut() {
+            Some(st) if st.reader.is_none() && !st.pending.is_empty() => st,
+            _ => return Ok(()),
+        };
+        let t0 = std::time::Instant::now();
+        let tmp = st.path.with_extension("tmp");
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            let tensors: Vec<(&str, &QTensor)> = st
+                .pending
+                .iter()
+                .map(|(n, t)| (n.as_str(), t.as_ref()))
+                .collect();
+            gguf_file::write(&mut f, &[], &tensors)?;
+        }
+        std::fs::rename(&tmp, &st.path)?;
+        eprintln!(
+            "[gemma4-qcache] wrote {} tensors to {} in {}ms",
+            st.pending.len(),
+            st.path.display(),
+            t0.elapsed().as_millis()
+        );
+        st.pending.clear();
+        let _ = HashMap::<(), ()>::new();
+        Ok(())
+    }
+}
+
 // ── Projection (dense or quantized-in-memory) ───────────────────────────────
 
 /// Linear projection that can be quantized at load time: the checkpoint
@@ -39,17 +138,27 @@ impl Proj {
             Some(dtype) => {
                 // K-quants require the reduction dim % 256 == 0.
                 let dtype = moe_quant_dtype_for(in_dim, dtype);
+                if std::env::var("GEMMA4_QDEBUG").is_ok() {
+                    eprintln!("[qdebug] Proj {} in={} out={} dtype={:?}", vb.prefix(), in_dim, out_dim, dtype);
+                }
                 let dev = vb.device().clone();
-                let weight = vb.get((out_dim, in_dim), "weight")?;
-                // Quantize via the CPU: avoids an f32 copy of the full weight
-                // on the GPU (the tied lm_head alone is ~3 GB in f32).
-                let weight = if dev.is_cuda() {
-                    let cpu = weight.to_device(&Device::Cpu)?;
-                    QTensor::quantize_onto(&cpu, dtype, &dev)?
+                let cache_key = vb.prefix();
+                let weight = if let Some(q) = qcache::get(&cache_key, &dev) {
+                    QMatMul::QTensor(Arc::new(q))
                 } else {
-                    QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?
+                    let weight = vb.get((out_dim, in_dim), "weight")?;
+                    // Quantize via the CPU: avoids an f32 copy of the full
+                    // weight on the GPU (the tied lm_head alone is ~3 GB f32).
+                    let weight = if dev.is_cuda() {
+                        let cpu = weight.to_device(&Device::Cpu)?;
+                        QTensor::quantize_onto(&cpu, dtype, &dev)?
+                    } else {
+                        QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?
+                    };
+                    let weight = Arc::new(weight);
+                    qcache::put(&cache_key, &weight);
+                    QMatMul::QTensor(weight)
                 };
-                let weight = QMatMul::from_qtensor(weight)?;
                 let bias = if bias {
                     Some(vb.get(out_dim, "bias")?.to_dtype(DType::F32)?)
                 } else {
@@ -269,6 +378,8 @@ struct Router {
     proj: Proj,
     scale: Tensor,
     per_expert_scale: Vec<f32>,
+    /// Same values kept on-device for the sync-free fused routing path.
+    per_expert_scale_t: Tensor,
     top_k: usize,
     scalar_root: f64,
     eps: f64,
@@ -281,14 +392,15 @@ impl Router {
     fn new(cfg: &Gemma4TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let proj = Proj::new(cfg.hidden_size, cfg.num_experts, false, vb.pp("proj"), quant)?;
         let scale = vb.get(cfg.hidden_size, "scale")?;
-        let per_expert_scale = vb
+        let per_expert_scale_t = vb
             .get(cfg.num_experts, "per_expert_scale")?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
+            .to_dtype(DType::F32)?;
+        let per_expert_scale = per_expert_scale_t.to_vec1::<f32>()?;
         Ok(Self {
             proj,
             scale,
             per_expert_scale,
+            per_expert_scale_t,
             top_k: cfg.top_k_experts,
             scalar_root: (cfg.hidden_size as f64).sqrt().recip(),
             eps: cfg.rms_norm_eps,
@@ -317,6 +429,31 @@ impl Router {
             );
         }
         Ok(plan)
+    }
+
+    /// Sync-free routing for the fused CUDA expert path: everything stays on
+    /// the device. Returns (`ids` [tokens, top_k] u32, `weights`
+    /// [tokens, top_k] f32), where weights are renormalized over the top-k
+    /// and multiplied by per_expert_scale — identical semantics to
+    /// `route()`.
+    fn route_gpu(&self, xs_flat: &Tensor) -> Result<(Tensor, Tensor)> {
+        let xs = v_norm(xs_flat, self.eps)?;
+        let xs = xs.broadcast_mul(&self.scale)?;
+        let xs = (xs * self.scalar_root)?;
+        let logits = self.proj.forward(&xs)?.to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?; // [T, E]
+        let sorted = probs.arg_sort_last_dim(false)?; // descending, u32
+        let ids = sorted.narrow(1, 0, self.top_k)?.contiguous()?; // [T, k]
+        let topw = probs.gather(&ids, 1)?; // [T, k]
+        let denom = topw.sum_keepdim(1)?;
+        let w = topw.broadcast_div(&denom)?;
+        let t = ids.dim(0)?;
+        let pes = self
+            .per_expert_scale_t
+            .index_select(&ids.flatten_all()?, 0)?
+            .reshape((t, self.top_k))?;
+        let w = (w * pes)?;
+        Ok((ids, w))
     }
 }
 
@@ -382,24 +519,33 @@ impl Experts {
             Some(dtype) if vb.device().is_cuda() => {
                 // Quantize on the CPU and upload only the quantized bytes:
                 // avoids multi-GB f32 transients on the GPU during load.
-                // One projection at a time keeps the peak small.
+                // One projection at a time keeps the peak small. Both stacks
+                // go through the disk cache — on a warm cache the safetensors
+                // for the experts (the bulk of the model) are never read.
                 let dev = vb.device().clone();
                 let gu_dtype = moe_quant_dtype_for(h, dtype);
                 let dn_dtype = moe_quant_dtype_for(inter, dtype);
-                let gu = {
+                let gu_key = format!("{}.gate_up_proj", vb.prefix());
+                let dn_key = format!("{}.down_proj", vb.prefix());
+                let gate_up = if let Some(q) = qcache::get(&gu_key, &dev) {
+                    Arc::new(q)
+                } else {
                     let t = vb
                         .get((e, 2 * inter, h), "gate_up_proj")?
                         .to_device(&Device::Cpu)?;
-                    QTensor::quantize_onto(&t, gu_dtype, &dev)?
+                    let q = Arc::new(QTensor::quantize_onto(&t, gu_dtype, &dev)?);
+                    qcache::put(&gu_key, &q);
+                    q
                 };
-                let dn = {
+                let down = if let Some(q) = qcache::get(&dn_key, &dev) {
+                    Arc::new(q)
+                } else {
                     let t = vb.get((e, h, inter), "down_proj")?.to_device(&Device::Cpu)?;
-                    QTensor::quantize_onto(&t, dn_dtype, &dev)?
+                    let q = Arc::new(QTensor::quantize_onto(&t, dn_dtype, &dev)?);
+                    qcache::put(&dn_key, &q);
+                    q
                 };
-                ExpertWeights::QuantFused {
-                    gate_up: Arc::new(gu),
-                    down: Arc::new(dn),
-                }
+                ExpertWeights::QuantFused { gate_up, down }
             }
             Some(dtype) => {
                 let gate_up = vb.get((e, 2 * inter, h), "gate_up_proj")?;
@@ -437,36 +583,32 @@ impl Experts {
     }
 
     /// Fused CUDA path: one indexed-MoE kernel per projection, all selected
-    /// experts of all tokens in a single launch.
+    /// experts of all tokens in a single launch. `ids` [tokens, top_k] u32
+    /// and `weights` [tokens, top_k] f32 live on the device (route_gpu) —
+    /// the whole path is free of host round-trips.
     fn forward_fused(
         &self,
         xs_flat: &Tensor,
-        plan: &RoutingPlan,
+        ids: &Tensor,
+        weights: &Tensor,
         gate_up: &QTensor,
         down: &QTensor,
     ) -> Result<Tensor> {
-        let device = xs_flat.device();
         let out_dtype = xs_flat.dtype();
         let (tokens, hidden) = xs_flat.dims2()?;
-        let topk = plan.first().map(|c| c.len()).unwrap_or(0);
-
-        let mut ids = Vec::with_capacity(tokens * topk);
-        let mut ws = Vec::with_capacity(tokens * topk);
-        for choices in plan.iter() {
-            for &(e, w) in choices {
-                ids.push(e as u32);
-                ws.push(w);
-            }
-        }
-        let ids_t = Tensor::from_vec(ids, (tokens, topk), device)?;
 
         let x32 = xs_flat.to_dtype(DType::F32)?.reshape((tokens, 1, hidden))?;
-        let gu = gate_up.indexed_moe_forward(&x32, &ids_t)?; // [tokens, topk, 2*inter]
-        let chunks = gu.chunk(2, D::Minus1)?;
-        let hidden_act = (chunks[0].apply(&self.act_fn)? * &chunks[1])?;
-        let dn = down.indexed_moe_forward(&hidden_act.contiguous()?, &ids_t)?; // [tokens, topk, hidden]
+        let gu = gate_up.indexed_moe_forward(&x32, ids)?; // [tokens, topk, 2*inter]
+        // Single-launch act(gate) * up (item-3 fusion); falls back to the
+        // chunk/act/mul composition off-CUDA.
+        let act = match self.act_fn {
+            Activation::Silu => candle_nn::fused::SwigluAct::Silu,
+            _ => candle_nn::fused::SwigluAct::GeluTanh,
+        };
+        let hidden_act = candle_nn::fused::fused_swiglu(&gu, act)?;
+        let dn = down.indexed_moe_forward(&hidden_act, ids)?; // [tokens, topk, hidden]
 
-        let w_t = Tensor::from_vec(ws, (tokens, topk, 1), device)?;
+        let w_t = weights.unsqueeze(2)?; // [tokens, topk, 1]
         let out = dn.broadcast_mul(&w_t)?.sum(1)?; // [tokens, hidden]
         out.to_dtype(out_dtype)
     }
@@ -474,9 +616,6 @@ impl Experts {
     /// `xs_flat`: [tokens, hidden] (already normalized). Groups tokens by
     /// expert, runs each hit expert once, and combines weighted outputs.
     fn forward(&self, xs_flat: &Tensor, plan: &RoutingPlan) -> Result<Tensor> {
-        if let ExpertWeights::QuantFused { gate_up, down } = &self.weights {
-            return self.forward_fused(xs_flat, plan, gate_up, down);
-        }
         let device = xs_flat.device();
         let dtype = xs_flat.dtype();
 
@@ -839,9 +978,17 @@ impl MoeBlock {
 
         let (b, s, h) = residual.dims3()?;
         let flat = residual.reshape((b * s, h))?;
-        let plan = self.router.route(&flat)?;
         let h2 = self.pre_feedforward_layernorm_2.forward(&flat)?;
-        let h2 = self.experts.forward(&h2, &plan)?;
+        let h2 = if let ExpertWeights::QuantFused { gate_up, down } = &self.experts.weights {
+            // Fully on-device routing + fused expert dispatch: no host
+            // round-trips anywhere in the MoE branch.
+            let (ids, weights) = self.router.route_gpu(&flat)?;
+            self.experts
+                .forward_fused(&h2, &ids, &weights, gate_up, down)?
+        } else {
+            let plan = self.router.route(&flat)?;
+            self.experts.forward(&h2, &plan)?
+        };
         let h2 = h2.reshape((b, s, h))?;
         let h2 = self.post_feedforward_layernorm_2.forward(&h2)?;
 
@@ -1003,10 +1150,16 @@ impl DecoderLayer {
             shared_kv,
         )?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
-        let xs = xs.apply(&self.mlp)?;
+        // Item-3 fusion: (residual add) + (pre-ffw rmsnorm) in one launch.
+        let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
+            &xs,
+            residual,
+            &self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps as f32,
+            false,
+        )?;
+        let residual = &xs_res;
+        let xs = ffw_in.apply(&self.mlp)?;
         // MoE models sum the (normalized) dense and expert branches before the
         // shared post-feedforward norm; router/experts read the raw residual.
         let xs = match self.moe.as_ref() {
@@ -1164,14 +1317,22 @@ impl TextModel {
                 // than matmul against the F16 gather table.
                 Some(dtype) => {
                     let emb = embed_tokens.embeddings();
-                    let q = if emb.device().is_cuda() {
-                        let cpu = emb.to_device(&Device::Cpu)?;
-                        QTensor::quantize_onto(&cpu, dtype, emb.device())?
+                    let key = "lm_head.tied";
+                    let q = if let Some(q) = qcache::get(key, emb.device()) {
+                        Arc::new(q)
                     } else {
-                        QTensor::quantize(&emb.to_dtype(DType::F32)?, dtype)?
+                        let q = if emb.device().is_cuda() {
+                            let cpu = emb.to_device(&Device::Cpu)?;
+                            QTensor::quantize_onto(&cpu, dtype, emb.device())?
+                        } else {
+                            QTensor::quantize(&emb.to_dtype(DType::F32)?, dtype)?
+                        };
+                        let q = Arc::new(q);
+                        qcache::put(key, &q);
+                        q
                     };
                     Proj::Quant {
-                        weight: QMatMul::from_qtensor(q)?,
+                        weight: QMatMul::QTensor(q),
                         bias: None,
                     }
                 }
@@ -1205,6 +1366,11 @@ impl TextModel {
             } else {
                 (None, None, None)
             };
+
+        // Persist any freshly quantized tensors (no-op on warm cache).
+        if let Err(e) = qcache::flush() {
+            eprintln!("[gemma4-qcache] flush failed: {e}");
+        }
 
         Ok(Self {
             embed_tokens,

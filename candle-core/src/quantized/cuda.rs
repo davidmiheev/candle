@@ -535,9 +535,9 @@ fn indexed_moe_forward_fused_q8_1_input(
     let input_view = input.slice(0..);
     quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
 
-    // output buffer
+    // output buffer (no memset: the kernel writes every element)
     let outsize = batch * topk * n;
-    let out = dev.alloc_zeros::<f32>(outsize)?;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
