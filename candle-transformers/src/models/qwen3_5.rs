@@ -402,104 +402,99 @@ impl GatedDeltaNet {
 
     /// Single-token step. x: [b=1, 1, hidden]. All recurrence math in f32.
     fn forward_step(&mut self, x: &Tensor) -> Result<Tensor> {
+        self.forward_seq(x)
+    }
+
+    /// Batched GDN over a whole [1, T, hidden] chunk: projections, causal
+    /// depthwise conv, norms and gating are computed for all T positions at
+    /// once; the sequential delta-rule recurrence runs inside ONE
+    /// `gdn_scan` kernel launch with the state resident on-chip. T == 1 is
+    /// the decode step (same path, graph-friendly: a handful of launches).
+    fn forward_seq(&mut self, x: &Tensor) -> Result<Tensor> {
         let dt = x.dtype();
         let dev = x.device().clone();
+        let (_b, t_len, _h) = x.dims3()?;
         let key_dim = self.n_k_heads * self.d_k;
         let value_dim = self.n_v_heads * self.d_v;
         let conv_dim = 2 * key_dim + value_dim;
 
-        let x_flat = x.reshape((1, ()))?; // [1, hidden]
-        let qkv = self.in_proj_qkv.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, conv_dim]
-        let z = self.in_proj_z.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, value_dim]
-        let b_raw = self.in_proj_b.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, n_v]
-        let a_raw = self.in_proj_a.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, n_v]
+        let x_flat = x.reshape((t_len, ()))?; // [T, hidden]
+        let qkv = self.in_proj_qkv.forward(&x_flat)?.to_dtype(DType::F32)?; // [T, conv_dim]
+        let z = self.in_proj_z.forward(&x_flat)?.to_dtype(DType::F32)?; // [T, value_dim]
+        let b_raw = self.in_proj_b.forward(&x_flat)?.to_dtype(DType::F32)?; // [T, n_v]
+        let a_raw = self.in_proj_a.forward(&x_flat)?.to_dtype(DType::F32)?; // [T, n_v]
 
-        // β = σ(b);   g = -exp(A_log) · softplus(a + dt_bias)
-        let beta = candle_nn::ops::sigmoid(&b_raw)?.reshape(self.n_v_heads)?;
-        let sp = softplus(&a_raw.reshape(self.n_v_heads)?.broadcast_add(&self.dt_bias)?)?;
-        let g = (sp * &self.neg_a)?; // [n_v]
-        let decay = g.exp()?; // per-head multiplicative state decay ∈ (0, 1)
+        // β = σ(b);   decay = exp(-exp(A_log) · softplus(a + dt_bias))
+        let beta = candle_nn::ops::sigmoid(&b_raw)?; // [T, n_v]
+        let sp = softplus(&b_cast(&a_raw, &self.dt_bias)?)?;
+        let decay = sp.broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?.exp()?;
 
-        // Rolling depthwise conv window + SiLU.
-        let qkv_col = qkv.reshape((conv_dim, 1))?;
-        let window = match &self.conv_state {
-            Some(prev) => Tensor::cat(&[&prev.narrow(1, 1, self.conv_kernel - 1)?, &qkv_col], 1)?,
-            None => {
-                let zeros =
-                    Tensor::zeros((conv_dim, self.conv_kernel - 1), DType::F32, &dev)?;
-                Tensor::cat(&[&zeros, &qkv_col], 1)?
-            }
+        // Causal depthwise conv over the chunk: pad with the rolling state
+        // (last kernel-1 inputs of the previous chunk, zeros at start).
+        let qkv_t = qkv.t()?.contiguous()?; // [conv_dim, T]
+        let prev = match &self.conv_state {
+            Some(w) => w.narrow(1, 1, self.conv_kernel - 1)?,
+            None => Tensor::zeros((conv_dim, self.conv_kernel - 1), DType::F32, &dev)?,
         };
-        self.conv_state = Some(window.clone());
-        let conved = (window * &self.conv1d_weight)?.sum(1)?; // [conv_dim]
-        let conved = silu_f32(&conved)?;
-        let dbg = std::env::var("QWEN35_DEBUG_GDN").is_ok();
-        if dbg {
-            dbg_stats("  gdn.qkv_raw", &qkv)?;
-            dbg_stats("  gdn.conved", &conved)?;
-            dbg_stats("  gdn.z", &z)?;
-            dbg_stats("  gdn.beta", &beta)?;
-            dbg_stats("  gdn.decay", &decay)?;
+        let padded = Tensor::cat(&[&prev, &qkv_t], 1)?; // [conv_dim, T + k - 1]
+        self.conv_state = Some(padded.narrow(1, t_len.saturating_sub(1), self.conv_kernel)?.contiguous()?);
+        let mut conv = padded
+            .narrow(1, 0, t_len)?
+            .broadcast_mul(&self.conv1d_weight.narrow(1, 0, 1)?)?;
+        for j in 1..self.conv_kernel {
+            conv = (conv
+                + padded
+                    .narrow(1, j, t_len)?
+                    .broadcast_mul(&self.conv1d_weight.narrow(1, j, 1)?)?)?;
         }
+        let conved = silu_f32(&conv)?.t()?.contiguous()?; // [T, conv_dim]
 
-        let q = conved.narrow(0, 0, key_dim)?.reshape((self.n_k_heads, self.d_k))?;
+        let q = conved
+            .narrow(1, 0, key_dim)?
+            .reshape((t_len, self.n_k_heads, self.d_k))?;
         let k = conved
-            .narrow(0, key_dim, key_dim)?
-            .reshape((self.n_k_heads, self.d_k))?;
+            .narrow(1, key_dim, key_dim)?
+            .reshape((t_len, self.n_k_heads, self.d_k))?;
         let v = conved
-            .narrow(0, 2 * key_dim, value_dim)?
-            .reshape((self.n_v_heads, self.d_v))?;
-        // L2 norm on q, k per head; q additionally scaled by d_k^-0.5
-        // (verified against the HF reference: without the scale the state
-        // readout is sqrt(d_k) too large).
+            .narrow(1, 2 * key_dim, value_dim)?
+            .reshape((t_len, self.n_v_heads, self.d_v))?;
+        // Per-head L2 norm; q additionally scaled by d_k^-0.5 (validated
+        // against the HF reference).
         let q = (l2norm_last(&q)? * (self.d_k as f64).powf(-0.5))?;
         let k = l2norm_last(&k)?;
-        // Broadcast k/q heads to v heads (grouped: n_v / n_k values per key head).
-        let group = self.n_v_heads / self.n_k_heads;
-        let q = expand_heads(&q, group)?; // [n_v, d_k]
-        let k = expand_heads(&k, group)?; // [n_v, d_k]
 
-        // Delta rule (per v-head, S: [d_v, d_k]):
-        //   S ← decay · S
-        //   pred = S · k                  [d_v]
-        //   S ← S + β · (v − pred) ⊗ k
-        //   o = S · q                     [d_v]
-        let s = match &self.s_state {
-            Some(s) => s.clone(),
-            None => Tensor::zeros((self.n_v_heads, self.d_v, self.d_k), DType::F32, &dev)?,
+        let st = match &self.s_state {
+            Some(st) => st.clone(),
+            None => {
+                let z = Tensor::zeros(
+                    (self.n_v_heads, self.d_v, self.d_k),
+                    DType::F32,
+                    &dev,
+                )?;
+                self.s_state = Some(z.clone());
+                z
+            }
         };
-        let s = s.broadcast_mul(&decay.reshape((self.n_v_heads, 1, 1))?)?;
-        let k3 = k.reshape((self.n_v_heads, self.d_k, 1))?;
-        let pred = s.matmul(&k3)?.squeeze(2)?; // [n_v, d_v]
-        let err = (v - pred)?; // [n_v, d_v]
-        let err = err.broadcast_mul(&beta.reshape((self.n_v_heads, 1))?)?;
-        let outer = err
-            .reshape((self.n_v_heads, self.d_v, 1))?
-            .matmul(&k.reshape((self.n_v_heads, 1, self.d_k))?)?;
-        let s = (s + outer)?;
-        self.s_state = Some(s.clone());
-        let q3 = q.reshape((self.n_v_heads, self.d_k, 1))?;
-        let o = s.matmul(&q3)?.squeeze(2)?; // [n_v, d_v]
+        // One launch for the whole recurrence; `st` is updated in place
+        // (self.s_state shares storage, so decode continues seamlessly).
+        let o = candle_nn::fused::static_decode::gdn_scan(
+            &q.contiguous()?,
+            &k.contiguous()?,
+            &v.contiguous()?,
+            &beta.contiguous()?,
+            &decay.contiguous()?,
+            &st,
+        )?; // [T, n_v, d_v]
 
-        if dbg {
-            dbg_stats("  gdn.o_prenorm", &o)?;
-        }
-        // Gated per-head RMS norm: w * x̂ * silu(z).
+        // Gated per-head RMS norm: w * x̂ * silu(z), batched over T.
         let var = o.sqr()?.mean_keepdim(D::Minus1)?;
         let o = o.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        let o = o.broadcast_mul(&self.norm_weight.reshape((1, self.d_v))?)?;
-        let zg = silu_f32(&z.reshape((self.n_v_heads, self.d_v))?)?;
+        let o = o.broadcast_mul(&self.norm_weight.reshape((1, 1, self.d_v))?)?;
+        let zg = silu_f32(&z.reshape((t_len, self.n_v_heads, self.d_v))?)?;
         let o = (o * zg)?;
 
-        let o = o.reshape((1, 1, value_dim))?.to_dtype(dt)?;
-        if dbg {
-            dbg_stats("  gdn.gated_norm_out", &o)?;
-        }
-        let out = self.out_proj.forward(&o)?;
-        if dbg {
-            dbg_stats("  gdn.out_proj_out", &out)?;
-        }
-        Ok(out)
+        let o = o.reshape((1, t_len, value_dim))?.to_dtype(dt)?;
+        self.out_proj.forward(&o)
     }
 }
 
@@ -509,6 +504,10 @@ fn expand_heads(x: &Tensor, group: usize) -> Result<Tensor> {
     }
     let (h, d) = x.dims2()?;
     x.unsqueeze(1)?.expand((h, group, d))?.reshape((h * group, d))
+}
+
+fn b_cast(a: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    a.broadcast_add(&bias.reshape((1, bias.dim(0)?))?)
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -769,33 +768,30 @@ impl Model {
         self.pos = 0;
     }
 
-    /// Executor-compatible forward. NAIVE: iterates the input positions one
-    /// at a time (the GDN recurrence is sequential in this scaffold), and
-    /// returns lm_head logits of the final position only: [1, 1, vocab].
+    /// Executor-compatible forward. Processes the whole input chunk in one
+    /// batched pass: projections/conv/norms/attention are computed for all
+    /// positions at once and the GDN recurrence runs as a single on-chip
+    /// scan kernel per layer. Returns lm_head logits of the final position:
+    /// [1, 1, vocab].
     pub fn forward(&mut self, input: &Tensor, start_pos: usize) -> Result<Tensor> {
         if start_pos == 0 && self.pos != 0 {
             self.clear_kv_cache();
         }
         let (_b, seq) = input.dims2()?;
-        let mut last: Option<Tensor> = None;
         let debug = std::env::var("QWEN35_DEBUG").is_ok();
-        for t in 0..seq {
-            let tok = input.narrow(1, t, 1)?;
-            let mut x = self.embed_tokens.forward(&tok)?; // [1, 1, hidden]
-            let pos = self.pos;
-            if debug && t == seq - 1 {
-                dbg_stats("layer00", &x)?;
-            }
-            for (li, layer) in self.layers.iter_mut().enumerate() {
-                x = layer.forward_step(&x, &self.rotary, pos)?;
-                if debug && t == seq - 1 && li < 5 {
-                    dbg_stats(&format!("layer{:02}", li + 1), &x)?;
-                }
-            }
-            self.pos += 1;
-            last = Some(x);
+        let mut x = self.embed_tokens.forward(input)?; // [1, seq, hidden]
+        let pos = self.pos;
+        if debug {
+            dbg_stats("layer00", &x.narrow(1, seq - 1, 1)?)?;
         }
-        let x = last.ok_or_else(|| candle::Error::Msg("empty input".into()))?;
+        for (li, layer) in self.layers.iter_mut().enumerate() {
+            x = layer.forward_step(&x, &self.rotary, pos)?;
+            if debug && li < 5 {
+                dbg_stats(&format!("layer{:02}", li + 1), &x.narrow(1, seq - 1, 1)?)?;
+            }
+        }
+        self.pos += seq;
+        let x = x.narrow(1, seq - 1, 1)?;
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
     }

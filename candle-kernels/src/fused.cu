@@ -129,3 +129,156 @@ FUSED_SWIGLU_OP(float, fused_swiglu_f32)
 FUSED_ADD_RMSNORM_OP(__nv_bfloat16, fused_add_rmsnorm_bf16)
 FUSED_SWIGLU_OP(__nv_bfloat16, fused_swiglu_bf16)
 #endif
+
+// ── Static-decode kernels (CUDA-graph-replayable decode step) ──────────────
+// The decode position lives in a device u32 scalar; these kernels index off
+// it so a captured graph replays correctly as the position advances.
+
+// Write one new K/V vector into preallocated [heads, max_seq, dim] buffers
+// at the position read from pos.
+template <typename T>
+__device__ void kv_write(
+    T* __restrict__ kbuf,          // [heads, max_seq, dim]
+    T* __restrict__ vbuf,
+    const T* __restrict__ knew,    // [heads, dim]
+    const T* __restrict__ vnew,
+    const unsigned int* __restrict__ pos,
+    const int heads,
+    const int max_seq,
+    const int dim
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = heads * dim;
+    if (idx >= total) return;
+    const int h = idx / dim;
+    const int d = idx % dim;
+    const unsigned int p = *pos;
+    const size_t off = ((size_t)h * max_seq + p) * dim + d;
+    kbuf[off] = knew[idx];
+    vbuf[off] = vnew[idx];
+}
+
+// Additive causal mask row for attention over the full static buffer:
+// mask[j] = 0 where the key at j is visible from position *pos, else -inf.
+// window == 0 => global causal; window > 0 => sliding (j > pos - window).
+template <typename T>
+__device__ void mask_from_pos(
+    T* __restrict__ mask,          // [max_seq]
+    const unsigned int* __restrict__ pos,
+    const int max_seq,
+    const int window
+) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= max_seq) return;
+    const int p = (int)(*pos);
+    bool vis = j <= p;
+    if (window > 0) vis = vis && (j > p - window);
+    mask[j] = vis ? (T)0.0f : (T)(-1e30f);
+}
+
+extern "C" __global__ void set_u32(unsigned int* dst, unsigned int v) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *dst = v;
+    }
+}
+
+extern "C" __global__ void incr_u32(unsigned int* pos) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *pos = *pos + 1u;
+    }
+}
+
+#define KV_WRITE_OP(TY, FN)                                                   \
+extern "C" __global__ void FN(                                                \
+    TY* kbuf, TY* vbuf, const TY* knew, const TY* vnew,                       \
+    const unsigned int* pos, const int heads, const int max_seq,              \
+    const int dim) {                                                          \
+    kv_write<TY>(kbuf, vbuf, knew, vnew, pos, heads, max_seq, dim);           \
+}
+
+#define MASK_FROM_POS_OP(TY, FN)                                              \
+extern "C" __global__ void FN(                                                \
+    TY* mask, const unsigned int* pos, const int max_seq, const int window) { \
+    mask_from_pos<TY>(mask, pos, max_seq, window);                            \
+}
+
+KV_WRITE_OP(float, kv_write_f32)
+MASK_FROM_POS_OP(float, mask_from_pos_f32)
+
+#if __CUDA_ARCH__ >= 800
+KV_WRITE_OP(__nv_bfloat16, kv_write_bf16)
+MASK_FROM_POS_OP(__nv_bfloat16, mask_from_pos_bf16)
+#endif
+
+// ── Gated-DeltaNet sequential scan ──────────────────────────────────────────
+// Runs the whole delta-rule recurrence for one layer in a single launch:
+//   S <- decay_t * S;  err = (v_t - S k_t) * beta_t;  S += err (x) k_t;
+//   o_t = S q_t
+// State rows (d_v) are independent, so blocks tile (v_head, d_v-chunk) with
+// the chunk's state rows resident in shared memory; k/q for the step are
+// staged once per block. Grid: n_v * ceil(d_v/GDN_ROWS). Block: GDN_ROWS.
+#define GDN_ROWS 64
+extern "C" __global__ void gdn_scan_f32(
+    const float* __restrict__ q,     // [T, n_k, d_k]
+    const float* __restrict__ k,     // [T, n_k, d_k]
+    const float* __restrict__ v,     // [T, n_v, d_v]
+    const float* __restrict__ beta,  // [T, n_v]
+    const float* __restrict__ decay, // [T, n_v]
+    float* __restrict__ s,           // [n_v, d_v, d_k] (in/out)
+    float* __restrict__ o,           // [T, n_v, d_v]
+    const int T, const int n_k, const int n_v, const int d_k, const int d_v) {
+    const int chunks = (d_v + GDN_ROWS - 1) / GDN_ROWS;
+    const int h = blockIdx.x / chunks;      // v-head
+    const int chunk = blockIdx.x % chunks;  // d_v row chunk
+    const int row0 = chunk * GDN_ROWS;
+    const int kh = (h * n_k) / n_v;         // grouped k-head
+    const int tid = threadIdx.x;
+    const int row = row0 + tid;             // this thread's d_v row
+
+    extern __shared__ float smem[];
+    float* S = smem;               // [GDN_ROWS, d_k]
+    float* kk = smem + GDN_ROWS * d_k; // [d_k]
+    float* qq = kk + d_k;              // [d_k]
+
+    // Load this chunk's state rows.
+    if (row < d_v) {
+        const float* src = s + ((size_t)h * d_v + row) * d_k;
+        float* dst = S + (size_t)tid * d_k;
+        for (int j = 0; j < d_k; ++j) dst[j] = src[j];
+    }
+    __syncthreads();
+
+    for (int t = 0; t < T; ++t) {
+        for (int j = tid; j < d_k; j += blockDim.x) {
+            kk[j] = k[((size_t)t * n_k + kh) * d_k + j];
+            qq[j] = q[((size_t)t * n_k + kh) * d_k + j];
+        }
+        __syncthreads();
+        if (row < d_v) {
+            const float dcy = decay[(size_t)t * n_v + h];
+            const float bt = beta[(size_t)t * n_v + h];
+            float* Sr = S + (size_t)tid * d_k;
+            float pred = 0.f;
+            #pragma unroll 4
+            for (int j = 0; j < d_k; ++j) {
+                Sr[j] *= dcy;
+                pred += Sr[j] * kk[j];
+            }
+            const float err = (v[((size_t)t * n_v + h) * d_v + row] - pred) * bt;
+            float out = 0.f;
+            #pragma unroll 4
+            for (int j = 0; j < d_k; ++j) {
+                Sr[j] += err * kk[j];
+                out += Sr[j] * qq[j];
+            }
+            o[((size_t)t * n_v + h) * d_v + row] = out;
+        }
+        __syncthreads();
+    }
+
+    if (row < d_v) {
+        float* dst = s + ((size_t)h * d_v + row) * d_k;
+        const float* src = S + (size_t)tid * d_k;
+        for (int j = 0; j < d_k; ++j) dst[j] = src[j];
+    }
+}
