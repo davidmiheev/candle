@@ -189,10 +189,10 @@ impl Rotary {
 
 #[derive(Debug, Clone)]
 struct FullAttention {
-    q_proj: Linear, // out = heads*head_dim (*2 when gated: [q | gate] per head)
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: Proj, // out = heads*head_dim (*2 when gated: [q | gate] per head)
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
     q_norm: RmsNormPlus1,
     k_norm: RmsNormPlus1,
     n_heads: usize,
@@ -212,14 +212,14 @@ impl FullAttention {
         let h = cfg.hidden_size;
         let hd = cfg.head_dim();
         Ok(Self {
-            q_proj: linear_no_bias(
+            q_proj: qproj(
                 h,
                 cfg.num_attention_heads * hd * if cfg.attn_output_gate { 2 } else { 1 },
                 vb.pp("q_proj"),
             )?,
-            k_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("k_proj"))?,
-            v_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("v_proj"))?,
-            o_proj: linear_no_bias(cfg.num_attention_heads * hd, h, vb.pp("o_proj"))?,
+            k_proj: qproj(h, cfg.num_key_value_heads * hd, vb.pp("k_proj"))?,
+            v_proj: qproj(h, cfg.num_key_value_heads * hd, vb.pp("v_proj"))?,
+            o_proj: qproj(cfg.num_attention_heads * hd, h, vb.pp("o_proj"))?,
             q_norm: RmsNormPlus1::new(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
             k_norm: RmsNormPlus1::new(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
             n_heads: cfg.num_attention_heads,
@@ -336,15 +336,15 @@ fn causal_mask(q_len: usize, k_len: usize, device: &Device) -> Result<Tensor> {
 
 #[derive(Debug, Clone)]
 struct GatedDeltaNet {
-    in_proj_qkv: Linear, // [2*key_dim + value_dim, hidden]
-    in_proj_z: Linear,   // [value_dim, hidden]
+    in_proj_qkv: Proj, // [2*key_dim + value_dim, hidden]
+    in_proj_z: Proj,   // [value_dim, hidden]
     in_proj_b: Linear,   // [n_v_heads, hidden]
     in_proj_a: Linear,   // [n_v_heads, hidden]
     conv1d_weight: Tensor, // [conv_dim, kernel] f32 (depthwise)
     dt_bias: Tensor,     // [n_v_heads] f32
     neg_a: Tensor,       // [n_v_heads] f32: -exp(A_log)
     norm_weight: Tensor, // [d_v] f32
-    out_proj: Linear,
+    out_proj: Proj,
     n_k_heads: usize,
     n_v_heads: usize,
     d_k: usize,
@@ -375,15 +375,15 @@ impl GatedDeltaNet {
         let a_log = vb.get(cfg.linear_num_value_heads, "A_log")?.to_dtype(DType::F32)?;
         let neg_a = a_log.exp()?.neg()?;
         Ok(Self {
-            in_proj_qkv: linear_no_bias(h, conv_dim, vb.pp("in_proj_qkv"))?,
-            in_proj_z: linear_no_bias(h, value_dim, vb.pp("in_proj_z"))?,
+            in_proj_qkv: qproj(h, conv_dim, vb.pp("in_proj_qkv"))?,
+            in_proj_z: qproj(h, value_dim, vb.pp("in_proj_z"))?,
             in_proj_b: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_b"))?,
             in_proj_a: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_a"))?,
             conv1d_weight: conv_w,
             dt_bias: vb.get(cfg.linear_num_value_heads, "dt_bias")?.to_dtype(DType::F32)?,
             neg_a,
             norm_weight: vb.pp("norm").get(cfg.linear_value_head_dim, "weight")?.to_dtype(DType::F32)?,
-            out_proj: linear_no_bias(value_dim, h, vb.pp("out_proj"))?,
+            out_proj: qproj(value_dim, h, vb.pp("out_proj"))?,
             n_k_heads: cfg.linear_num_key_heads,
             n_v_heads: cfg.linear_num_value_heads,
             d_k: cfg.linear_key_head_dim,
@@ -506,6 +506,73 @@ fn expand_heads(x: &Tensor, group: usize) -> Result<Tensor> {
     x.unsqueeze(1)?.expand((h, group, d))?.reshape((h * group, d))
 }
 
+use crate::models::gemma4::text::qcache;
+use candle::quantized::{GgmlDType, QMatMul, QTensor};
+use std::sync::{Arc, Mutex, OnceLock};
+
+fn quant_setting() -> &'static Mutex<Option<GgmlDType>> {
+    static S: OnceLock<Mutex<Option<GgmlDType>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// K-quants need the reduction dim to be a multiple of 256; fall back to
+/// q8_0 (32-wide blocks) when it is not.
+fn quant_dtype_for(in_dim: usize, requested: GgmlDType) -> GgmlDType {
+    let block = requested.block_size();
+    if block > 32 && in_dim % 256 != 0 {
+        GgmlDType::Q8_0
+    } else if in_dim % 32 != 0 {
+        // Should not happen for these checkpoints; keep unquantized-safe.
+        requested
+    } else {
+        requested
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Proj {
+    Plain(Linear),
+    Quant(QMatMul),
+}
+
+impl Module for Proj {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Plain(l) => l.forward(x),
+            Self::Quant(q) => q.forward(x),
+        }
+    }
+}
+
+/// Linear projection honoring the model-level quantize setting, with the
+/// quantized bytes served from / persisted to the shared GGUF disk cache.
+fn qproj(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Proj> {
+    let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
+    match quant {
+        None => Ok(Proj::Plain(linear_no_bias(in_dim, out_dim, vb)?)),
+        Some(dtype) => {
+            let dtype = quant_dtype_for(in_dim, dtype);
+            let dev = vb.device().clone();
+            let key = vb.prefix();
+            let q = if let Some(q) = qcache::get(&key, &dev) {
+                Arc::new(q)
+            } else {
+                let w = vb.get((out_dim, in_dim), "weight")?;
+                let q = if dev.is_cuda() {
+                    let cpu = w.to_device(&Device::Cpu)?;
+                    QTensor::quantize_onto(&cpu, dtype, &dev)?
+                } else {
+                    QTensor::quantize(&w.to_dtype(DType::F32)?, dtype)?
+                };
+                let q = Arc::new(q);
+                qcache::put(&key, &q);
+                q
+            };
+            Ok(Proj::Quant(QMatMul::QTensor(q)))
+        }
+    }
+}
+
 fn b_cast(a: &Tensor, bias: &Tensor) -> Result<Tensor> {
     a.broadcast_add(&bias.reshape((1, bias.dim(0)?))?)
 }
@@ -522,17 +589,17 @@ fn silu_f32(x: &Tensor) -> Result<Tensor> {
 
 #[derive(Debug, Clone)]
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: Proj,
+    up_proj: Proj,
+    down_proj: Proj,
 }
 
 impl Mlp {
     fn new(h: usize, inter: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            gate_proj: linear_no_bias(h, inter, vb.pp("gate_proj"))?,
-            up_proj: linear_no_bias(h, inter, vb.pp("up_proj"))?,
-            down_proj: linear_no_bias(inter, h, vb.pp("down_proj"))?,
+            gate_proj: qproj(h, inter, vb.pp("gate_proj"))?,
+            up_proj: qproj(h, inter, vb.pp("up_proj"))?,
+            down_proj: qproj(inter, h, vb.pp("down_proj"))?,
         })
     }
 
@@ -715,7 +782,7 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNormPlus1,
-    lm_head: Linear,
+    lm_head: Proj,
     rotary: Rotary,
     device: Device,
     /// Absolute position of the next token (recurrent state cursor).
@@ -724,6 +791,19 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_quant(cfg, vb, None)
+    }
+
+    /// Like [`Self::new`], but with `quant` set every large projection is
+    /// quantized to that GGML dtype at load (activations stay in the
+    /// VarBuilder dtype); quantized bytes go through the shared GGUF disk
+    /// cache so warm loads skip both the safetensors reads and quantization.
+    pub fn new_with_quant(
+        cfg: &Qwen35TextConfig,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        *quant_setting().lock().unwrap_or_else(|p| p.into_inner()) = quant;
         // Multimodal checkpoints prefix the text stack with `language_model`.
         let root = if vb.contains_tensor("model.language_model.embed_tokens.weight") {
             vb.pp("model").pp("language_model")
@@ -741,12 +821,32 @@ impl Model {
             layers.push(DecoderLayer::new(cfg, i, vb_l.pp(i))?);
         }
         let norm = RmsNormPlus1::new(cfg.hidden_size, cfg.rms_norm_eps, root.pp("norm"))?;
+        let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            match quant {
+                None => Proj::Plain(Linear::new(embed_tokens.embeddings().clone(), None)),
+                Some(dtype) => {
+                    let emb = embed_tokens.embeddings();
+                    let dtype = quant_dtype_for(cfg.hidden_size, dtype);
+                    let key = "lm_head.tied";
+                    let q = if let Some(q) = qcache::get(key, emb.device()) {
+                        Arc::new(q)
+                    } else {
+                        let cpu = emb.to_device(&Device::Cpu)?;
+                        let q = Arc::new(QTensor::quantize_onto(&cpu, dtype, emb.device())?);
+                        qcache::put(key, &q);
+                        q
+                    };
+                    Proj::Quant(QMatMul::QTensor(q))
+                }
+            }
         } else {
-            linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            qproj(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let rotary = Rotary::new(cfg, vb.device())?;
+        if let Err(e) = qcache::flush() {
+            eprintln!("[qwen3_5-qcache] flush failed: {e}");
+        }
         Ok(Self {
             embed_tokens,
             layers,
