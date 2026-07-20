@@ -682,6 +682,48 @@ pub(crate) struct SharedKvStates {
     sliding: Option<(Tensor, Tensor)>,
 }
 
+/// Shared state for the CUDA-graph-replayable static decode path
+/// (`GEMMA4_STATIC_DECODE=<max_seq>`): the decode position lives in a device
+/// u32 scalar; masks over the full preallocated KV extent are rewritten from
+/// it each token; per-layer KV buffers are fixed `[kv_heads, max, head_dim]`
+/// allocations written in place. Everything a captured graph touches is
+/// address- and shape-static, so one captured decode step replays for the
+/// whole generation.
+#[derive(Debug, Clone)]
+pub struct StaticCtx {
+    pub pos: Tensor,          // u32 [1]
+    pub mask_global: Tensor,  // f32 [max_seq]
+    pub mask_sliding: Tensor, // f32 [max_seq]
+    pub max_seq: usize,
+    pub sliding_window: usize,
+}
+
+impl StaticCtx {
+    pub fn new(max_seq: usize, sliding_window: usize, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            pos: Tensor::zeros(1, DType::U32, dev)?,
+            mask_global: Tensor::zeros(max_seq, DType::F32, dev)?,
+            mask_sliding: Tensor::zeros(max_seq, DType::F32, dev)?,
+            max_seq,
+            sliding_window,
+        })
+    }
+
+    /// Rewrite both mask rows for the current position (graph-replayable).
+    pub fn refresh_masks(&self) -> Result<()> {
+        candle_nn::fused::static_decode::mask_from_pos(&self.mask_global, &self.pos, 0)?;
+        candle_nn::fused::static_decode::mask_from_pos(
+            &self.mask_sliding,
+            &self.pos,
+            self.sliding_window,
+        )
+    }
+
+    pub fn reset(&self) -> Result<()> {
+        candle_nn::fused::static_decode::write_u32(&self.pos, 0)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Attention {
     q_proj: Proj,
@@ -703,6 +745,9 @@ struct Attention {
     rotary_emb_local: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
     use_flash_attn: bool,
+    /// Preallocated `[kv_heads, max_seq, head_dim]` K/V for the static
+    /// decode path (lazily allocated on first static forward).
+    static_kv: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
@@ -812,6 +857,7 @@ impl Attention {
             rotary_emb_local,
             kv_cache,
             use_flash_attn: cfg.use_flash_attn,
+            static_kv: None,
         })
     }
 
@@ -923,6 +969,113 @@ impl Attention {
         attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, ()))?
+            .apply(&self.o_proj)
+    }
+
+    /// One-token attention over the full preallocated KV extent, indexed by
+    /// the device position scalar. Shape/address-static: replayable inside a
+    /// captured CUDA graph.
+    fn forward_static(
+        &mut self,
+        xs: &Tensor, // [1, 1, hidden]
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        debug_assert_eq!((b_sz, q_len), (1, 1));
+
+        let q = self.q_proj.forward(xs)?;
+        let q = q
+            .reshape((1, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = self.q_norm.forward(&q)?;
+
+        // RoPE at the device position: gather one row of the tables.
+        let rope_at_pos = |x: &Tensor, cos: &Tensor, sin: &Tensor| -> Result<Tensor> {
+            let cos_p = cos.index_select(&ctx.pos, 0)?; // [1, half]
+            let sin_p = sin.index_select(&ctx.pos, 0)?;
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos_p, &sin_p)
+        };
+        let (cos_t, sin_t) = if self.is_sliding {
+            (&self.rotary_emb_local.cos, &self.rotary_emb_local.sin)
+        } else {
+            (&self.rotary_emb_global.cos, &self.rotary_emb_global.sin)
+        };
+
+        let (kbuf, vbuf, q) = if self.is_kv_shared {
+            let q = rope_at_pos(&q, cos_t, sin_t)?;
+            let slot = if self.is_sliding {
+                shared_kv.sliding.as_ref()
+            } else {
+                shared_kv.full.as_ref()
+            };
+            let (k, v) = slot.ok_or_else(|| {
+                candle::Error::Msg("kv-shared layer ran before any storing layer".to_string())
+            })?;
+            (k.clone(), v.clone(), q)
+        } else {
+            let k_proj = self.k_proj.as_ref().expect("non-shared layer has k_proj");
+            let k_norm = self.k_norm.as_ref().expect("non-shared layer has k_norm");
+            let k_raw = k_proj
+                .forward(xs)?
+                .reshape((1, 1, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v_raw = match self.v_proj.as_ref() {
+                Some(v_proj) => v_proj
+                    .forward(xs)?
+                    .reshape((1, 1, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?,
+                None => k_raw.clone(),
+            };
+            let k = k_norm.forward(&k_raw)?;
+            let v = v_norm(&v_raw, self.rms_norm_eps)?;
+            let q = rope_at_pos(&q, cos_t, sin_t)?;
+            let k = rope_at_pos(&k, cos_t, sin_t)?;
+
+            if self.static_kv.is_none() {
+                let dev = xs.device();
+                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
+                self.static_kv = Some((
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                ));
+            }
+            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            candle_nn::fused::static_decode::kv_write(
+                kbuf,
+                vbuf,
+                &k.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
+                &v.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
+                &ctx.pos,
+            )?;
+            if self.store_full_length_kv {
+                let slot = if self.is_sliding {
+                    &mut shared_kv.sliding
+                } else {
+                    &mut shared_kv.full
+                };
+                *slot = Some((kbuf.clone(), vbuf.clone()));
+            }
+            (kbuf.clone(), vbuf.clone(), q)
+        };
+
+        // Grouped attention over the full buffer.
+        // q: [1, heads, 1, hd] -> [kvh, group, hd]
+        let q3 = q.reshape((self.num_kv_heads, self.num_kv_groups, self.head_dim))?;
+        let scores = q3
+            .contiguous()?
+            .matmul(&kbuf.transpose(1, 2)?.contiguous()?)?; // [kvh, group, max]
+        let mask = if self.is_sliding {
+            &ctx.mask_sliding
+        } else {
+            &ctx.mask_global
+        };
+        let scores = scores
+            .to_dtype(DType::F32)?
+            .broadcast_add(&mask.reshape((1, 1, ctx.max_seq))?)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(kbuf.dtype())?;
+        let out = probs.matmul(&vbuf.contiguous()?)?; // [kvh, group, hd]
+        out.reshape((1, 1, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
 
@@ -1190,6 +1343,53 @@ impl DecoderLayer {
         Ok(xs)
     }
 
+    /// One-token, shape-static step (graph-replayable): identical math to
+    /// [`Self::forward`] with the attention going through the preallocated
+    /// KV buffers and the device-side position/mask context.
+    fn forward_static(
+        &mut self,
+        xs: &Tensor, // [1, 1, hidden]
+        per_layer_input: Option<&Tensor>,
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward_static(&xs, ctx, shared_kv)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
+            &xs,
+            residual,
+            &self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps as f32,
+            false,
+        )?;
+        let residual = &xs_res;
+        let xs = ffw_in.apply(&self.mlp)?;
+        let xs = match self.moe.as_ref() {
+            Some(moe) => moe.forward(&xs, residual)?,
+            None => xs,
+        };
+        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        let mut xs = (residual + xs)?;
+        if let (Some(gate), Some(proj), Some(norm), Some(pli)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let residual = &xs;
+            let gated = xs.apply(gate)?.apply(&self.act_fn)?;
+            let mixed = (gated * pli)?;
+            let projected = mixed.apply(proj)?.apply(norm)?;
+            xs = (residual + projected)?;
+        }
+        if self.layer_scalar != 1.0 {
+            xs = (xs * self.layer_scalar)?;
+        }
+        Ok(xs)
+    }
+
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache()
     }
@@ -1253,6 +1453,7 @@ pub struct TextModel {
     dtype: DType,
     hidden_size: usize,
     sliding_window: usize,
+    static_ctx: Option<StaticCtx>,
 }
 
 impl TextModel {
@@ -1387,6 +1588,7 @@ impl TextModel {
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
+            static_ctx: None,
         })
     }
 
@@ -1495,10 +1697,73 @@ impl TextModel {
         }
     }
 
+    /// Switch this model to the shape-static decode path with a fixed
+    /// context budget. Allocates nothing until the first static step.
+    pub fn enable_static_decode(&mut self, max_seq: usize) -> Result<()> {
+        self.static_ctx = Some(StaticCtx::new(
+            max_seq,
+            self.sliding_window,
+            &self.device,
+        )?);
+        Ok(())
+    }
+
+    pub fn static_enabled(&self) -> bool {
+        self.static_ctx.is_some()
+    }
+
+    /// One-token decode step against the preallocated KV buffers. All
+    /// position dependence lives on-device (position scalar, masks, rope
+    /// row gather), so the whole call is CUDA-graph replayable; the
+    /// position advances at the end of the step (inside the graph).
+    pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let xs = self.embed_tokens(input_ids)?;
+        let per_layer_inputs = self.per_layer_inputs(input_ids, &xs)?;
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        ctx.refresh_masks()?;
+        let mut shared_kv = SharedKvStates::default();
+        let mut xs = xs;
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let pli = match per_layer_inputs.as_ref() {
+                Some(p) => Some(p.i((.., .., layer_idx, ..))?),
+                None => None,
+            };
+            xs = layer.forward_static(&xs, pli.as_ref(), ctx, &mut shared_kv)?;
+        }
+        let logits = xs.apply(&self.norm)?.apply(&self.lm_head)?;
+        let logits = match self.final_logit_softcapping {
+            None => logits,
+            Some(sc) => ((logits / sc)?.tanh()? * sc)?,
+        };
+        candle_nn::fused::static_decode::incr_u32(&ctx.pos)?;
+        Ok(logits)
+    }
+
+    /// Rewind the static context to position 0 (host-side; call between
+    /// requests, never inside a captured graph).
+    pub fn reset_static(&mut self) -> Result<()> {
+        match self.static_ctx.as_ref() {
+            Some(ctx) => ctx.reset(),
+            None => Ok(()),
+        }
+    }
+
+    /// Debug helper: read back the device position scalar.
+    pub fn static_pos_debug(&self) -> Result<u32> {
+        match self.static_ctx.as_ref() {
+            Some(ctx) => Ok(ctx.pos.to_vec1::<u32>()?[0]),
+            None => Ok(u32::MAX),
+        }
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        let _ = self.reset_static();
     }
 }
 
