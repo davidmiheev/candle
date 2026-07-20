@@ -508,7 +508,11 @@ impl Model {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(b_size, seq_len, seqlen_offset)?;
 
-        for layer in self.layers.iter_mut() {
+        let cap: usize = std::env::var("GEMMA_CAPTURE_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        for layer in self.layers.iter_mut().take(cap) {
             let mask = if layer.sliding_window.is_some() {
                 &sliding_attention_mask
             } else {
@@ -529,7 +533,11 @@ impl Model {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        let cap: usize = std::env::var("GEMMA_CAPTURE_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+        for layer in self.layers.iter_mut().take(cap) {
             layer.clear_kv_cache()
         }
     }

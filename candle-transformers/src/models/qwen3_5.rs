@@ -27,6 +27,16 @@ fn default_conv_kernel() -> usize {
     4
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RopeParameters {
+    pub rope_theta: Option<f64>,
+    pub partial_rotary_factor: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen35TextConfig {
     pub hidden_size: usize,
@@ -37,12 +47,20 @@ pub struct Qwen35TextConfig {
     pub vocab_size: usize,
     #[serde(default)]
     pub head_dim: Option<usize>,
-    pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
     pub rms_norm_eps: f64,
+    /// When true (default), q_proj packs [q | gate] per head and the
+    /// attention output is gated by sigmoid(gate).
+    #[serde(default = "default_true")]
+    pub attn_output_gate: bool,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default = "default_one")]
     pub partial_rotary_factor: f64,
+
     /// "linear_attention" | "full_attention" per layer.
     pub layer_types: Vec<String>,
     // Gated DeltaNet dims.
@@ -68,8 +86,21 @@ impl Qwen35TextConfig {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
+    pub fn theta(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|r| r.rope_theta)
+            .or(self.rope_theta)
+            .unwrap_or(1e7)
+    }
+    pub fn rotary_factor(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|r| r.partial_rotary_factor)
+            .unwrap_or(self.partial_rotary_factor)
+    }
     pub fn rotary_dim(&self) -> usize {
-        ((self.head_dim() as f64) * self.partial_rotary_factor) as usize
+        ((self.head_dim() as f64) * self.rotary_factor()) as usize
     }
     fn is_linear(&self, layer: usize) -> bool {
         self.layer_types
@@ -106,8 +137,8 @@ impl RmsNormPlus1 {
 }
 
 fn l2norm_last(x: &Tensor) -> Result<Tensor> {
-    let n = x.sqr()?.sum_keepdim(D::Minus1)?;
-    x.broadcast_div(&(n + 1e-6)?.sqrt()?)
+    let n = x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+    x.broadcast_div(&(n + 1e-6)?)
 }
 
 // ── Rotary (partial) ────────────────────────────────────────────────────────
@@ -124,7 +155,7 @@ impl Rotary {
         let rot = cfg.rotary_dim();
         let max_pos = 32768usize;
         let inv: Vec<f32> = (0..rot / 2)
-            .map(|i| (1.0 / cfg.rope_theta.powf(2.0 * i as f64 / rot as f64)) as f32)
+            .map(|i| (1.0 / cfg.theta().powf(2.0 * i as f64 / rot as f64)) as f32)
             .collect();
         let inv = Tensor::from_vec(inv, (1, rot / 2), device)?;
         let pos: Vec<f32> = (0..max_pos).map(|p| p as f32).collect();
@@ -141,8 +172,8 @@ impl Rotary {
     /// (interleaved pairs, matching the reference), passes the rest through.
     fn apply(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (_b, _h, seq, hd) = x.dims4()?;
-        let cos = self.cos.narrow(0, pos, seq)?;
-        let sin = self.sin.narrow(0, pos, seq)?;
+        let cos = self.cos.narrow(0, pos, seq)?.to_dtype(x.dtype())?;
+        let sin = self.sin.narrow(0, pos, seq)?.to_dtype(x.dtype())?;
         if self.rot == hd {
             candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
         } else {
@@ -158,7 +189,7 @@ impl Rotary {
 
 #[derive(Debug, Clone)]
 struct FullAttention {
-    q_proj: Linear, // out = heads * head_dim * 2 ([q | gate] per head)
+    q_proj: Linear, // out = heads*head_dim (*2 when gated: [q | gate] per head)
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
@@ -167,6 +198,7 @@ struct FullAttention {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    gated: bool,
     kv_cache: Option<(Tensor, Tensor)>,
 }
 
@@ -180,7 +212,11 @@ impl FullAttention {
         let h = cfg.hidden_size;
         let hd = cfg.head_dim();
         Ok(Self {
-            q_proj: linear_no_bias(h, cfg.num_attention_heads * hd * 2, vb.pp("q_proj"))?,
+            q_proj: linear_no_bias(
+                h,
+                cfg.num_attention_heads * hd * if cfg.attn_output_gate { 2 } else { 1 },
+                vb.pp("q_proj"),
+            )?,
             k_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("k_proj"))?,
             v_proj: linear_no_bias(h, cfg.num_key_value_heads * hd, vb.pp("v_proj"))?,
             o_proj: linear_no_bias(cfg.num_attention_heads * hd, h, vb.pp("o_proj"))?,
@@ -189,6 +225,7 @@ impl FullAttention {
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.num_key_value_heads,
             head_dim: hd,
+            gated: cfg.attn_output_gate,
             kv_cache: None,
         })
     }
@@ -202,10 +239,16 @@ impl FullAttention {
         let (b, seq, _h) = x.dims3()?;
         let hd = self.head_dim;
 
-        let qg = self.q_proj.forward(x)?; // [b, seq, heads*hd*2]
-        let qg = qg.reshape((b, seq, self.n_heads, 2, hd))?;
-        let q = qg.i((.., .., .., 0, ..))?; // [b, seq, heads, hd]
-        let gate = qg.i((.., .., .., 1, ..))?;
+        let qg = self.q_proj.forward(x)?;
+        let (q, gate) = if self.gated {
+            let qg = qg.reshape((b, seq, self.n_heads, 2, hd))?;
+            (
+                qg.i((.., .., .., 0, ..))?, // [b, seq, heads, hd]
+                Some(qg.i((.., .., .., 1, ..))?),
+            )
+        } else {
+            (qg.reshape((b, seq, self.n_heads, hd))?, None)
+        };
 
         let k = self
             .k_proj
@@ -239,7 +282,8 @@ impl FullAttention {
         let vx = repeat_kv(&v, rep)?;
 
         let scale = 1.0 / (hd as f64).sqrt();
-        let att = (q.matmul(&kx.transpose(2, 3)?)? * scale)?;
+        let q = q.contiguous()?;
+        let att = (q.matmul(&kx.transpose(2, 3)?.contiguous()?)? * scale)?;
         // seq == 1 in the naive path → no causal mask needed; guard anyway.
         let att = if seq > 1 {
             let total = kx.dim(2)?;
@@ -253,8 +297,12 @@ impl FullAttention {
         let out = att.matmul(&vx)?; // [b, heads, seq, hd]
 
         // Elementwise output gate: attn * sigmoid(gate).
-        let gate = gate.transpose(1, 2)?; // [b, heads, seq, hd]
-        let out = (out * candle_nn::ops::sigmoid(&gate.contiguous()?)?)?;
+        let out = if let Some(gate) = gate {
+            let gate = gate.transpose(1, 2)?; // [b, heads, seq, hd]
+            (out * candle_nn::ops::sigmoid(&gate.contiguous()?)?)?
+        } else {
+            out
+        };
 
         let out = out
             .transpose(1, 2)?
@@ -270,6 +318,7 @@ fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
     let (b, kvh, s, hd) = x.dims4()?;
     x.unsqueeze(2)?
         .expand((b, kvh, rep, s, hd))?
+        .contiguous()?
         .reshape((b, kvh * rep, s, hd))
 }
 
@@ -384,6 +433,14 @@ impl GatedDeltaNet {
         self.conv_state = Some(window.clone());
         let conved = (window * &self.conv1d_weight)?.sum(1)?; // [conv_dim]
         let conved = silu_f32(&conved)?;
+        let dbg = std::env::var("QWEN35_DEBUG_GDN").is_ok();
+        if dbg {
+            dbg_stats("  gdn.qkv_raw", &qkv)?;
+            dbg_stats("  gdn.conved", &conved)?;
+            dbg_stats("  gdn.z", &z)?;
+            dbg_stats("  gdn.beta", &beta)?;
+            dbg_stats("  gdn.decay", &decay)?;
+        }
 
         let q = conved.narrow(0, 0, key_dim)?.reshape((self.n_k_heads, self.d_k))?;
         let k = conved
@@ -392,8 +449,10 @@ impl GatedDeltaNet {
         let v = conved
             .narrow(0, 2 * key_dim, value_dim)?
             .reshape((self.n_v_heads, self.d_v))?;
-        // L2 norm on q, k per head.
-        let q = l2norm_last(&q)?;
+        // L2 norm on q, k per head; q additionally scaled by d_k^-0.5
+        // (verified against the HF reference: without the scale the state
+        // readout is sqrt(d_k) too large).
+        let q = (l2norm_last(&q)? * (self.d_k as f64).powf(-0.5))?;
         let k = l2norm_last(&k)?;
         // Broadcast k/q heads to v heads (grouped: n_v / n_k values per key head).
         let group = self.n_v_heads / self.n_k_heads;
@@ -422,6 +481,9 @@ impl GatedDeltaNet {
         let q3 = q.reshape((self.n_v_heads, self.d_k, 1))?;
         let o = s.matmul(&q3)?.squeeze(2)?; // [n_v, d_v]
 
+        if dbg {
+            dbg_stats("  gdn.o_prenorm", &o)?;
+        }
         // Gated per-head RMS norm: w * x̂ * silu(z).
         let var = o.sqr()?.mean_keepdim(D::Minus1)?;
         let o = o.broadcast_div(&(var + self.eps)?.sqrt()?)?;
@@ -430,7 +492,14 @@ impl GatedDeltaNet {
         let o = (o * zg)?;
 
         let o = o.reshape((1, 1, value_dim))?.to_dtype(dt)?;
-        self.out_proj.forward(&o)
+        if dbg {
+            dbg_stats("  gdn.gated_norm_out", &o)?;
+        }
+        let out = self.out_proj.forward(&o)?;
+        if dbg {
+            dbg_stats("  gdn.out_proj_out", &out)?;
+        }
+        Ok(out)
     }
 }
 
@@ -612,15 +681,34 @@ impl DecoderLayer {
 
     fn forward_step(&mut self, x: &Tensor, rotary: &Rotary, pos: usize) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
+        if std::env::var("QWEN35_DEBUG_GDN").is_ok() {
+            dbg_stats("  layer.input_ln_out", &normed)?;
+        }
         let mixed = match &mut self.mixer {
             Mixer::Full(a) => a.forward(&normed, rotary, pos)?,
             Mixer::Linear(g) => g.forward_step(&normed)?,
         };
+        if std::env::var("QWEN35_DEBUG_GDN").is_ok() {
+            dbg_stats("  layer.mixer_out", &mixed)?;
+        }
         let x = (x + mixed)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let f = self.ffn.forward(&normed)?;
         x + f
     }
+}
+
+fn dbg_stats(tag: &str, x: &Tensor) -> Result<()> {
+    let v = x.flatten_all()?.to_dtype(DType::F32)?;
+    let mean = v.mean_all()?.to_scalar::<f32>()?;
+    let var = v.sqr()?.mean_all()?.to_scalar::<f32>()? - mean * mean;
+    let f3 = v.narrow(0, 0, 3)?.to_vec1::<f32>()?;
+    eprintln!(
+        "{tag} mean={mean:.5} std={:.5} first3={:?}",
+        var.max(0.0).sqrt(),
+        f3.iter().map(|x| (x * 10000.0).round() / 10000.0).collect::<Vec<_>>()
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -690,12 +778,19 @@ impl Model {
         }
         let (_b, seq) = input.dims2()?;
         let mut last: Option<Tensor> = None;
+        let debug = std::env::var("QWEN35_DEBUG").is_ok();
         for t in 0..seq {
             let tok = input.narrow(1, t, 1)?;
             let mut x = self.embed_tokens.forward(&tok)?; // [1, 1, hidden]
             let pos = self.pos;
-            for layer in self.layers.iter_mut() {
+            if debug && t == seq - 1 {
+                dbg_stats("layer00", &x)?;
+            }
+            for (li, layer) in self.layers.iter_mut().enumerate() {
                 x = layer.forward_step(&x, &self.rotary, pos)?;
+                if debug && t == seq - 1 && li < 5 {
+                    dbg_stats(&format!("layer{:02}", li + 1), &x)?;
+                }
             }
             self.pos += 1;
             last = Some(x);
