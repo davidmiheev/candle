@@ -832,10 +832,18 @@ impl Attention {
                 cfg.effective_sliding_window(),
             ))
         } else {
-            KvCache::Normal(candle_nn::kv_cache::KvCache::new(
-                2,
-                cfg.max_position_embeddings,
-            ))
+            // Capacity note: candle's KvCache allocates the FULL capacity on
+            // first append. max_position_embeddings is 128k+ for these
+            // checkpoints — with many full-attention layers that is
+            // gigabytes of dead weight (gemma-4-31b: 1.07GB x 10 layers,
+            // which OOM'd a 32GB card). Cap to a serving context, tunable
+            // via GEMMA4_MAX_CONTEXT.
+            let max_ctx = std::env::var("GEMMA4_MAX_CONTEXT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(8192)
+                .min(cfg.max_position_embeddings);
+            KvCache::Normal(candle_nn::kv_cache::KvCache::new(2, max_ctx))
         };
 
         Ok(Self {
@@ -1685,7 +1693,16 @@ impl TextModel {
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
                 &mut shared_kv,
-            )?
+            )?;
+            if std::env::var("GEMMA4_LDEBUG").is_ok() {
+                let v = xs
+                    .narrow(1, seq_len - 1, 1)?
+                    .flatten_all()?
+                    .to_dtype(candle::DType::F32)?;
+                let mx = v.abs()?.max(0)?.to_scalar::<f32>()?;
+                let mean = v.mean_all()?.to_scalar::<f32>()?;
+                eprintln!("[ldbg] layer{layer_idx:02} mean={mean:.4} absmax={mx:.2}");
+            }
         }
         let logits = xs
             .narrow(1, seq_len - 1, 1)?
