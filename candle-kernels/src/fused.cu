@@ -282,3 +282,23 @@ extern "C" __global__ void gdn_scan_f32(
         for (int j = 0; j < d_k; ++j) dst[j] = src[j];
     }
 }
+
+// Chunked static-KV write: copy a [kv_heads, T, hd] chunk into the
+// preallocated [kv_heads, max_seq, hd] buffer at rows [pos, pos+T).
+// Prefill-path companion to kv_write (which writes one row at the
+// device-resident position inside the captured graph); this one runs
+// EAGERLY during chunked prefill, so pos arrives as a host launch arg.
+// Grid: (kv_heads, T). Threads: over hd.
+extern "C" __global__ void kv_write_chunk_bf16(
+    __nv_bfloat16* __restrict__ buf,       // [kv_heads, max_seq, hd]
+    const __nv_bfloat16* __restrict__ src, // [kv_heads, t, hd]
+    const unsigned int pos,
+    const int t,
+    const int max_seq,
+    const int hd) {
+    const int h = blockIdx.x;
+    const int r = blockIdx.y; // 0..t
+    __nv_bfloat16* dst = buf + ((size_t)h * max_seq + pos + r) * hd;
+    const __nv_bfloat16* s0 = src + ((size_t)h * t + r) * hd;
+    for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
+}

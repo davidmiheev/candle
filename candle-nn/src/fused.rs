@@ -426,6 +426,47 @@ pub mod static_decode {
         Ok(())
     }
 
+    /// Copy a [kv_heads, t, hd] bf16 chunk into the static KV buffer
+    /// ([kv_heads, max_seq, hd]) at rows [pos, pos+t). Eager prefill path:
+    /// `pos` is a host value (NOT graph-safe — decode keeps using kv_write
+    /// with the device-resident position).
+    pub fn kv_write_chunk(buf: &Tensor, src: &Tensor, pos: usize) -> Result<()> {
+        let (kv_heads, max_seq, hd) = buf.dims3()?;
+        let (h2, t, hd2) = src.dims3()?;
+        if h2 != kv_heads || hd2 != hd {
+            candle::bail!("kv_write_chunk: shape mismatch {:?} vs {:?}", buf.dims(), src.dims());
+        }
+        if pos + t > max_seq {
+            candle::bail!("kv_write_chunk: pos {pos} + t {t} exceeds max_seq {max_seq}");
+        }
+        let dev = match buf.device() {
+            candle::Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("kv_write_chunk: cuda only"),
+        };
+        let func = dev.get_or_load_func("kv_write_chunk_bf16", &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (kv_heads as u32, t as u32, 1),
+            block_dim: (hd.min(256) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bs, bo) = cuda_parts(buf)?;
+        let (ss, so) = cuda_parts(src)?;
+        with_slice!(bs, bo, BF16, bp, {
+            with_slice!(ss, so, BF16, sp, {
+                let (posu, ti, mi, hi) = (pos as u32, t as i32, max_seq as i32, hd as i32);
+                let mut b = func.builder();
+                b.arg(&bp);
+                b.arg(&sp);
+                b.arg(&posu);
+                b.arg(&ti);
+                b.arg(&mi);
+                b.arg(&hi);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
     /// Run the whole Gated-DeltaNet recurrence for a layer in ONE kernel
     /// launch. `s` ([n_v, d_v, d_k] f32) is updated in place; returns
     /// `o` [t, n_v, d_v] f32. All inputs must be contiguous f32 on CUDA.

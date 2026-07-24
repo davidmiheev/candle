@@ -980,6 +980,117 @@ impl Attention {
             .apply(&self.o_proj)
     }
 
+    /// Chunked prefill into the static KV buffers: processes [1, T, hidden]
+    /// at once (batched projections + rope with host offset), writes K/V
+    /// rows [pos, pos+T) via kv_write_chunk, and attends over the buffer
+    /// prefix with the same mask builder as the dynamic path. EAGER ONLY —
+    /// host `pos` makes this non-replayable; decode uses forward_static.
+    fn forward_static_chunk(
+        &mut self,
+        xs: &Tensor, // [1, T, hidden]
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+        pos: usize,
+    ) -> Result<Tensor> {
+        let (b_sz, t_len, _) = xs.dims3()?;
+        debug_assert_eq!(b_sz, 1);
+        let klen = pos + t_len;
+
+        let q = self.q_proj.forward(xs)?;
+        let q = q
+            .reshape((1, t_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = self.q_norm.forward(&q)?;
+        let (kbuf, vbuf, q) = if self.is_kv_shared {
+            // Rope Q only (the k output of the helper is discarded).
+            let (q, _k) = if self.is_sliding {
+                self.rotary_emb_local
+                    .apply_rotary_emb_qkv(&q, &q.clone(), pos)?
+            } else {
+                self.rotary_emb_global
+                    .apply_rotary_emb_qkv(&q, &q.clone(), pos)?
+            };
+            let slot = if self.is_sliding {
+                shared_kv.sliding.as_ref()
+            } else {
+                shared_kv.full.as_ref()
+            };
+            let (k, v) = slot.ok_or_else(|| {
+                candle::Error::Msg("kv-shared layer ran before any storing layer".to_string())
+            })?;
+            (k.clone(), v.clone(), q)
+        } else {
+            let k_proj = self.k_proj.as_ref().expect("non-shared layer has k_proj");
+            let k_norm = self.k_norm.as_ref().expect("non-shared layer has k_norm");
+            let k_raw = k_proj
+                .forward(xs)?
+                .reshape((1, t_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v_raw = match self.v_proj.as_ref() {
+                Some(v_proj) => v_proj
+                    .forward(xs)?
+                    .reshape((1, t_len, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?,
+                None => k_raw.clone(),
+            };
+            let k = k_norm.forward(&k_raw)?;
+            let v = v_norm(&v_raw, self.rms_norm_eps)?;
+            let (q, k) = if self.is_sliding {
+                self.rotary_emb_local.apply_rotary_emb_qkv(&q, &k, pos)?
+            } else {
+                self.rotary_emb_global.apply_rotary_emb_qkv(&q, &k, pos)?
+            };
+
+            if self.static_kv.is_none() {
+                let dev = xs.device();
+                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
+                self.static_kv = Some((
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                ));
+            }
+            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            let kc = k
+                .reshape((self.num_kv_heads, t_len, self.head_dim))?
+                .contiguous()?;
+            let vc = v
+                .reshape((self.num_kv_heads, t_len, self.head_dim))?
+                .contiguous()?;
+            candle_nn::fused::static_decode::kv_write_chunk(kbuf, &kc, pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk(vbuf, &vc, pos)?;
+            if self.store_full_length_kv {
+                let slot = if self.is_sliding {
+                    &mut shared_kv.sliding
+                } else {
+                    &mut shared_kv.full
+                };
+                *slot = Some((kbuf.clone(), vbuf.clone()));
+            }
+            (kbuf.clone(), vbuf.clone(), q)
+        };
+
+        // Attend over the written prefix with the dynamic-path mask builder.
+        let kpre = kbuf.narrow(1, 0, klen)?.unsqueeze(0)?; // [1, kvh, klen, hd]
+        let vpre = vbuf.narrow(1, 0, klen)?.unsqueeze(0)?;
+        let kpre = crate::utils::repeat_kv(kpre, self.num_kv_groups)?.contiguous()?;
+        let vpre = crate::utils::repeat_kv(vpre, self.num_kv_groups)?.contiguous()?;
+        let window = if self.is_sliding {
+            Some(ctx.sliding_window)
+        } else {
+            None
+        };
+        let mask =
+            prepare_decoder_attention_mask(1, t_len, pos, window, xs.dtype(), xs.device())?;
+        // Softmax scale 1.0 (q_norm absorbs it) — mirrors the dynamic path.
+        let attn = q.contiguous()?.matmul(&kpre.transpose(2, 3)?)?;
+        let attn = attn.broadcast_add(&mask)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&vpre)?;
+        out.transpose(1, 2)?
+            .reshape((1, t_len, ()))?
+            .apply(&self.o_proj)
+    }
+
     /// One-token attention over the full preallocated KV extent, indexed by
     /// the device position scalar. Shape/address-static: replayable inside a
     /// captured CUDA graph.
@@ -1354,6 +1465,53 @@ impl DecoderLayer {
     /// One-token, shape-static step (graph-replayable): identical math to
     /// [`Self::forward`] with the attention going through the preallocated
     /// KV buffers and the device-side position/mask context.
+    fn forward_static_chunk(
+        &mut self,
+        xs: &Tensor, // [1, T, hidden]
+        per_layer_input: Option<&Tensor>,
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+        pos: usize,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self
+            .self_attn
+            .forward_static_chunk(&xs, ctx, shared_kv, pos)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
+            &xs,
+            residual,
+            &self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps as f32,
+            false,
+        )?;
+        let residual = &xs_res;
+        let xs = ffw_in.apply(&self.mlp)?;
+        let xs = match self.moe.as_ref() {
+            Some(moe) => moe.forward(&xs, residual)?,
+            None => xs,
+        };
+        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        let mut xs = (residual + xs)?;
+        if let (Some(gate), Some(proj), Some(norm), Some(pli)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let residual = &xs;
+            let gated = xs.apply(gate)?.apply(&self.act_fn)?;
+            let mixed = (gated * pli)?;
+            let projected = mixed.apply(proj)?.apply(norm)?;
+            xs = (residual + projected)?;
+        }
+        if self.layer_scalar != 1.0 {
+            xs = (xs * self.layer_scalar)?;
+        }
+        Ok(xs)
+    }
+
     fn forward_static(
         &mut self,
         xs: &Tensor, // [1, 1, hidden]
@@ -1733,6 +1891,51 @@ impl TextModel {
     /// position dependence lives on-device (position scalar, masks, rope
     /// row gather), so the whole call is CUDA-graph replayable; the
     /// position advances at the end of the step (inside the graph).
+    /// Chunked static prefill: run the whole prompt through the static KV
+    /// buffers in GEMMA4_PREFILL_CHUNK-token chunks (default 512) with
+    /// batched attention, leaving the device position at prompt length and
+    /// returning last-position logits. Replaces token-stepped static prefill
+    /// (which measured ~64x slower on 1.6k-token prompts).
+    pub fn prefill_static_chunked(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let (_b, total) = input_ids.dims2()?;
+        if self.static_ctx.is_none() {
+            candle::bail!("static decode not enabled");
+        }
+        let chunk = std::env::var("GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(1);
+        let mut pos = 0usize;
+        let mut last: Option<Tensor> = None;
+        while pos < total {
+            let t = chunk.min(total - pos);
+            let ids = input_ids.narrow(1, pos, t)?;
+            let xs = self.embed_tokens(&ids)?;
+            let per_layer_inputs = self.per_layer_inputs(&ids, &xs)?;
+            let ctx = self.static_ctx.as_ref().unwrap();
+            let mut shared_kv = SharedKvStates::default();
+            let mut xs = xs;
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let pli = match per_layer_inputs.as_ref() {
+                    Some(p) => Some(p.i((.., .., layer_idx, ..))?),
+                    None => None,
+                };
+                xs = layer.forward_static_chunk(&xs, pli.as_ref(), ctx, &mut shared_kv, pos)?;
+            }
+            last = Some(xs.narrow(1, t - 1, 1)?);
+            pos += t;
+        }
+        let ctx = self.static_ctx.as_ref().unwrap();
+        candle_nn::fused::static_decode::write_u32(&ctx.pos, total as u32)?;
+        let xs = last.ok_or_else(|| candle::Error::Msg("empty prompt".into()))?;
+        let logits = xs.apply(&self.norm)?.apply(&self.lm_head)?;
+        match self.final_logit_softcapping {
+            None => Ok(logits),
+            Some(sc) => Ok(((logits / sc)?.tanh()? * sc)?),
+        }
+    }
+
     pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
         let xs = self.embed_tokens(input_ids)?;
         let per_layer_inputs = self.per_layer_inputs(input_ids, &xs)?;
