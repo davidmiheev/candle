@@ -318,3 +318,45 @@ extern "C" __global__ void kv_write_chunk_f32(
     const float* s0 = src + ((size_t)h * t + r) * hd;
     for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
 }
+
+// On-device greedy sampling for the graph-replayable decode loop:
+// argmax over the vocab, write the winning token id into the [1,1] u32
+// input buffer (self-feeding the next replay) and append to a history
+// ring indexed by a device step counter (which is incremented here).
+// Single-block grid; blockDim.x = 256.
+#define ARGMAX_OP(T, NAME) \
+extern "C" __global__ void NAME( \
+    const T* __restrict__ logits, \
+    const int vocab, \
+    unsigned int* __restrict__ input_buf, \
+    unsigned int* __restrict__ history, \
+    unsigned int* __restrict__ step) { \
+    __shared__ float smax[256]; \
+    __shared__ int sidx[256]; \
+    float best = -1e30f; int bi = 0; \
+    for (int j = threadIdx.x; j < vocab; j += blockDim.x) { \
+        float v = (float)logits[j]; \
+        if (v > best) { best = v; bi = j; } \
+    } \
+    smax[threadIdx.x] = best; sidx[threadIdx.x] = bi; \
+    __syncthreads(); \
+    for (int off = 128; off > 0; off >>= 1) { \
+        if (threadIdx.x < off) { \
+            if (smax[threadIdx.x + off] > smax[threadIdx.x] || \
+                (smax[threadIdx.x + off] == smax[threadIdx.x] && sidx[threadIdx.x + off] < sidx[threadIdx.x])) { \
+                smax[threadIdx.x] = smax[threadIdx.x + off]; \
+                sidx[threadIdx.x] = sidx[threadIdx.x + off]; \
+            } \
+        } \
+        __syncthreads(); \
+    } \
+    if (threadIdx.x == 0) { \
+        unsigned int tok = (unsigned int)sidx[0]; \
+        input_buf[0] = tok; \
+        unsigned int s = step[0]; \
+        history[s] = tok; \
+        step[0] = s + 1; \
+    } \
+}
+ARGMAX_OP(float, argmax_feed_f32)
+ARGMAX_OP(__nv_bfloat16, argmax_feed_bf16)

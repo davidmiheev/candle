@@ -430,6 +430,69 @@ pub mod static_decode {
     /// ([kv_heads, max_seq, hd]) at rows [pos, pos+t). Eager prefill path:
     /// `pos` is a host value (NOT graph-safe — decode keeps using kv_write
     /// with the device-resident position).
+    /// On-device greedy sampling: argmax(logits) -> writes token into
+    /// `input_buf` (u32 [1,1], self-feeding the next graph replay), appends
+    /// to `history` (u32 [cap]) at `step`, and increments `step` (u32 [1]).
+    /// Graph-safe: fixed addresses, no host interaction. Ties resolve to the
+    /// LOWEST index (matches candle argmax / host-side argmax semantics).
+    pub fn argmax_feed(
+        logits: &Tensor,
+        input_buf: &Tensor,
+        history: &Tensor,
+        step: &Tensor,
+    ) -> Result<()> {
+        let dev = match logits.device() {
+            candle::Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("argmax_feed: CUDA only"),
+        };
+        let vocab = logits.elem_count();
+        let kname = match logits.dtype() {
+            DType::F32 => "argmax_feed_f32",
+            DType::BF16 => "argmax_feed_bf16",
+            dt => candle::bail!("argmax_feed: unsupported dtype {dt:?}"),
+        };
+        let func = dev.get_or_load_func(kname, &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ls, lo) = cuda_parts(logits)?;
+        let (is_, io) = cuda_parts(input_buf)?;
+        let (hs, ho) = cuda_parts(history)?;
+        let (ss, so) = cuda_parts(step)?;
+        let vi = vocab as i32;
+        macro_rules! launch_with {
+            ($t:ident) => {
+                with_slice!(ls, lo, $t, lp, {
+                    with_slice!(is_, io, U32, ip, {
+                        with_slice!(hs, ho, U32, hp, {
+                            with_slice!(ss, so, U32, sp, {
+                                let mut b = func.builder();
+                                b.arg(&lp);
+                                b.arg(&vi);
+                                b.arg(&ip);
+                                b.arg(&hp);
+                                b.arg(&sp);
+                                unsafe { b.launch(cfg) }.w()?;
+                            });
+                        });
+                    });
+                });
+            };
+        }
+        match logits.dtype() {
+            DType::F32 => {
+                launch_with!(F32);
+            }
+            DType::BF16 => {
+                launch_with!(BF16);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     pub fn kv_write_chunk(buf: &Tensor, src: &Tensor, pos: usize) -> Result<()> {
         let (kv_heads, max_seq, hd) = buf.dims3()?;
         let (h2, t, hd2) = src.dims3()?;
