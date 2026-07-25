@@ -161,6 +161,23 @@ impl PaddleOCRVLModel {
     ///
     /// # Returns
     /// Logits for next token prediction
+    /// Shape-static decode passthroughs (see text::TextModel).
+    pub fn enable_static_decode(&mut self, max_seq: usize) -> Result<()> {
+        self.text.enable_static_decode(max_seq)
+    }
+    pub fn static_enabled(&self) -> bool {
+        self.text.static_enabled()
+    }
+    pub fn migrate_prefill_to_static(&mut self) -> Result<usize> {
+        self.text.migrate_prefill_to_static()
+    }
+    pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        self.text.forward_static(input_ids)
+    }
+    pub fn reset_static(&mut self) -> Result<()> {
+        self.text.reset_static()
+    }
+
     pub fn forward(
         &mut self,
         input_ids: &Tensor,

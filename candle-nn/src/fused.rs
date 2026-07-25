@@ -443,7 +443,11 @@ pub mod static_decode {
             candle::Device::Cuda(d) => d.clone(),
             _ => candle::bail!("kv_write_chunk: cuda only"),
         };
-        let func = dev.get_or_load_func("kv_write_chunk_bf16", &kernels::FUSED)?;
+        let kname = match buf.dtype() {
+            DType::F32 => "kv_write_chunk_f32",
+            _ => "kv_write_chunk_bf16",
+        };
+        let func = dev.get_or_load_func(kname, &kernels::FUSED)?;
         let cfg = LaunchConfig {
             grid_dim: (kv_heads as u32, t as u32, 1),
             block_dim: (hd.min(256) as u32, 1, 1),
@@ -451,19 +455,38 @@ pub mod static_decode {
         };
         let (bs, bo) = cuda_parts(buf)?;
         let (ss, so) = cuda_parts(src)?;
-        with_slice!(bs, bo, BF16, bp, {
-            with_slice!(ss, so, BF16, sp, {
-                let (posu, ti, mi, hi) = (pos as u32, t as i32, max_seq as i32, hd as i32);
-                let mut b = func.builder();
-                b.arg(&bp);
-                b.arg(&sp);
-                b.arg(&posu);
-                b.arg(&ti);
-                b.arg(&mi);
-                b.arg(&hi);
-                unsafe { b.launch(cfg) }.w()?;
-            });
-        });
+        let (posu, ti, mi, hi) = (pos as u32, t as i32, max_seq as i32, hd as i32);
+        match buf.dtype() {
+            DType::BF16 => {
+                with_slice!(bs, bo, BF16, bp, {
+                    with_slice!(ss, so, BF16, sp, {
+                        let mut b = func.builder();
+                        b.arg(&bp);
+                        b.arg(&sp);
+                        b.arg(&posu);
+                        b.arg(&ti);
+                        b.arg(&mi);
+                        b.arg(&hi);
+                        unsafe { b.launch(cfg) }.w()?;
+                    });
+                });
+            }
+            DType::F32 => {
+                with_slice!(bs, bo, F32, bp, {
+                    with_slice!(ss, so, F32, sp, {
+                        let mut b = func.builder();
+                        b.arg(&bp);
+                        b.arg(&sp);
+                        b.arg(&posu);
+                        b.arg(&ti);
+                        b.arg(&mi);
+                        b.arg(&hi);
+                        unsafe { b.launch(cfg) }.w()?;
+                    });
+                });
+            }
+            dt => candle::bail!("kv_write_chunk: unsupported dtype {dt:?}"),
+        }
         Ok(())
     }
 

@@ -302,3 +302,19 @@ extern "C" __global__ void kv_write_chunk_bf16(
     const __nv_bfloat16* s0 = src + ((size_t)h * t + r) * hd;
     for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
 }
+
+// F32 twin of the chunked static-KV write (paddleocr_vl runs F32; the
+// one-row kv_write already has an f32 instantiation via KV_WRITE_OP).
+extern "C" __global__ void kv_write_chunk_f32(
+    float* __restrict__ buf,       // [kv_heads, max_seq, hd]
+    const float* __restrict__ src, // [kv_heads, t, hd]
+    const unsigned int pos,
+    const int t,
+    const int max_seq,
+    const int hd) {
+    const int h = blockIdx.x;
+    const int r = blockIdx.y;
+    float* dst = buf + ((size_t)h * max_seq + pos + r) * hd;
+    const float* s0 = src + ((size_t)h * t + r) * hd;
+    for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
+}
