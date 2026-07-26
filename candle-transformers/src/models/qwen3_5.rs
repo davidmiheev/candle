@@ -168,6 +168,23 @@ impl Rotary {
         })
     }
 
+    /// Like [`Self::apply`] for a single token at a DEVICE-side position:
+    /// the cos/sin rows are gathered by `pos` (u32 [1]) so the op chain is
+    /// replayable inside a CUDA graph.
+    fn apply_gather(&self, x: &Tensor, pos: &Tensor) -> Result<Tensor> {
+        let (_b, _h, _seq, hd) = x.dims4()?;
+        let cos = self.cos.index_select(pos, 0)?.to_dtype(x.dtype())?; // [1, rot/2]
+        let sin = self.sin.index_select(pos, 0)?.to_dtype(x.dtype())?;
+        if self.rot == hd {
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        } else {
+            let xr = x.narrow(D::Minus1, 0, self.rot)?.contiguous()?;
+            let xp = x.narrow(D::Minus1, self.rot, hd - self.rot)?;
+            let xr = candle_nn::rotary_emb::rope_i(&xr, &cos, &sin)?;
+            Tensor::cat(&[xr, xp], D::Minus1)
+        }
+    }
+
     /// x: [b, heads, seq, head_dim]; rotates the first `rot` dims
     /// (interleaved pairs, matching the reference), passes the rest through.
     fn apply(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
@@ -200,6 +217,9 @@ struct FullAttention {
     head_dim: usize,
     gated: bool,
     kv_cache: Option<(Tensor, Tensor)>,
+    /// Preallocated [kv_heads, max_seq, head_dim] K/V for the shape-static
+    /// (graph-replayable) decode path.
+    static_kv: Option<(Tensor, Tensor)>,
 }
 
 fn linear_no_bias(inp: usize, out: usize, vb: VarBuilder) -> Result<Linear> {
@@ -227,11 +247,116 @@ impl FullAttention {
             head_dim: hd,
             gated: cfg.attn_output_gate,
             kv_cache: None,
+            static_kv: None,
         })
     }
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+    }
+
+    fn enable_static(&mut self, max_seq: usize, dtype: DType, dev: &Device) -> Result<()> {
+        if self.static_kv.is_none() {
+            let shape = (self.n_kv_heads, max_seq, self.head_dim);
+            self.static_kv = Some((
+                Tensor::zeros(shape, dtype, dev)?,
+                Tensor::zeros(shape, dtype, dev)?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy the dynamic KV cache (post-prefill) into the static buffers.
+    fn migrate_kv_to_static(&mut self) -> Result<usize> {
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        let (k, v) = match &self.kv_cache {
+            Some((k, v)) => (k.clone(), v.clone()),
+            None => return Ok(0),
+        };
+        let (_b, kvh, seq, hd) = k.dims4()?;
+        let kc = k.reshape((kvh, seq, hd))?.contiguous()?;
+        let vc = v.reshape((kvh, seq, hd))?.contiguous()?;
+        candle_nn::fused::static_decode::kv_write_chunk(kbuf, &kc, 0)?;
+        candle_nn::fused::static_decode::kv_write_chunk(vbuf, &vc, 0)?;
+        Ok(seq)
+    }
+
+    /// One-token attention over the full static buffer at the device
+    /// position. Mirrors `forward` exactly (gated q split, q/k norms,
+    /// partial rotary, f32 softmax, sigmoid output gate).
+    fn forward_static(
+        &mut self,
+        x: &Tensor, // [1, 1, hidden]
+        rotary: &Rotary,
+        pos: &Tensor,
+        mask: &Tensor, // f32 additive row [max_seq]
+    ) -> Result<Tensor> {
+        let hd = self.head_dim;
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .clone();
+        let max_seq = kbuf.dim(1)?;
+
+        let qg = self.q_proj.forward(x)?;
+        let (q, gate) = if self.gated {
+            let qg = qg.reshape((1, 1, self.n_heads, 2, hd))?;
+            (
+                qg.i((.., .., .., 0, ..))?,
+                Some(qg.i((.., .., .., 1, ..))?),
+            )
+        } else {
+            (qg.reshape((1, 1, self.n_heads, hd))?, None)
+        };
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((1, 1, self.n_kv_heads, hd))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((1, 1, self.n_kv_heads, hd))?;
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+        let q = q.transpose(1, 2)?; // [1, heads, 1, hd]
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+        let q = rotary.apply_gather(&q, pos)?;
+        let k = rotary.apply_gather(&k, pos)?;
+
+        candle_nn::fused::static_decode::kv_write(
+            &kbuf,
+            &vbuf,
+            &k.reshape((self.n_kv_heads, 1, hd))?.contiguous()?,
+            &v.reshape((self.n_kv_heads, 1, hd))?.contiguous()?,
+            pos,
+        )?;
+
+        // Broadcast-GQA over the buffer; softmax in f32 like the dynamic path.
+        let rep = self.n_heads / self.n_kv_heads;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let qg4 = q.reshape((1, self.n_kv_heads, rep, hd))?;
+        let kb = kbuf.unsqueeze(0)?;
+        let vb = vbuf.unsqueeze(0)?;
+        let att = (qg4.matmul(&kb.transpose(2, 3)?.contiguous()?)? * scale)?; // [1, kv, rep, max]
+        let att = att
+            .to_dtype(DType::F32)?
+            .broadcast_add(&mask.reshape((1, 1, 1, max_seq))?)?;
+        let att = candle_nn::ops::softmax_last_dim(&att)?.to_dtype(q.dtype())?;
+        let out = att.matmul(&vb.contiguous()?)?; // [1, kv, rep, hd]
+        let out = out.reshape((1, self.n_heads, 1, hd))?;
+        let out = if let Some(gate) = gate {
+            let gate = gate.transpose(1, 2)?; // [1, heads, 1, hd]
+            (out * candle_nn::ops::sigmoid(&gate.contiguous()?)?)?
+        } else {
+            out
+        };
+        let out = out.transpose(1, 2)?.reshape((1, 1, self.n_heads * hd))?;
+        self.o_proj.forward(&out)
     }
 
     /// x: [b, seq, hidden] (naive path is called with seq == 1).
@@ -356,6 +481,9 @@ struct GatedDeltaNet {
     /// Delta-rule state per v-head: [n_v_heads, d_v, d_k] f32
     /// (readout is `S · q`).
     s_state: Option<Tensor>,
+    /// Address-stable buffers for the graph path (enable_static).
+    conv_static: Option<Tensor>,
+    s_static: Option<Tensor>,
 }
 
 impl GatedDeltaNet {
@@ -392,12 +520,133 @@ impl GatedDeltaNet {
             eps: cfg.rms_norm_eps,
             conv_state: None,
             s_state: None,
+            conv_static: None,
+            s_static: None,
         })
     }
 
     fn clear_state(&mut self) {
         self.conv_state = None;
         self.s_state = None;
+    }
+
+    /// Allocate address-stable state buffers for the graph-replayable path.
+    /// s_state is already updated in place by gdn_scan; conv needs a fixed
+    /// rolling-window buffer.
+    fn enable_static(&mut self, dev: &Device) -> Result<()> {
+        let key_dim = self.n_k_heads * self.d_k;
+        let conv_dim = 2 * key_dim + self.n_v_heads * self.d_v;
+        if self.conv_static.is_none() {
+            self.conv_static = Some(Tensor::zeros(
+                (conv_dim, self.conv_kernel),
+                DType::F32,
+                dev,
+            )?);
+        }
+        if self.s_static.is_none() {
+            self.s_static = Some(Tensor::zeros(
+                (self.n_v_heads, self.d_v, self.d_k),
+                DType::F32,
+                dev,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Copy prefill state into the address-stable buffers and REBIND the
+    /// live state to them, so eager and graphed steps share storage.
+    fn migrate_state_to_static(&mut self) -> Result<()> {
+        let cbuf = self
+            .conv_static
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("gdn static not enabled".into()))?
+            .clone();
+        let sbuf = self.s_static.as_ref().unwrap().clone();
+        match &self.conv_state {
+            Some(c) => candle_nn::fused::static_decode::copy_into(&cbuf, c)?,
+            None => candle_nn::fused::static_decode::copy_into(
+                &cbuf,
+                &Tensor::zeros(cbuf.dims(), DType::F32, cbuf.device())?,
+            )?,
+        }
+        match &self.s_state {
+            Some(st) => candle_nn::fused::static_decode::copy_into(&sbuf, st)?,
+            None => candle_nn::fused::static_decode::copy_into(
+                &sbuf,
+                &Tensor::zeros(sbuf.dims(), DType::F32, sbuf.device())?,
+            )?,
+        }
+        self.conv_state = Some(cbuf);
+        self.s_state = Some(sbuf);
+        Ok(())
+    }
+
+    /// Graph-replayable single-token step: identical math to forward_seq at
+    /// T == 1, with the conv window rolled IN PLACE on the fixed buffer
+    /// (cat produces the new window, copy_into writes it back — recorded
+    /// inside the graph, so replays keep state correct).
+    fn forward_static_step(&mut self, x: &Tensor) -> Result<Tensor> {
+        let dt = x.dtype();
+        let key_dim = self.n_k_heads * self.d_k;
+        let value_dim = self.n_v_heads * self.d_v;
+        let cbuf = self
+            .conv_static
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("gdn static not enabled".into()))?
+            .clone();
+        let sbuf = self.s_static.as_ref().unwrap().clone();
+
+        let x_flat = x.reshape((1, ()))?;
+        let qkv = self.in_proj_qkv.forward(&x_flat)?.to_dtype(DType::F32)?; // [1, conv_dim]
+        let z = self.in_proj_z.forward(&x_flat)?.to_dtype(DType::F32)?;
+        let b_raw = self.in_proj_b.forward(&x_flat)?.to_dtype(DType::F32)?;
+        let a_raw = self.in_proj_a.forward(&x_flat)?.to_dtype(DType::F32)?;
+        let beta = candle_nn::ops::sigmoid(&b_raw)?;
+        let sp = softplus(&b_cast(&a_raw, &self.dt_bias)?)?;
+        let decay = sp.broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?.exp()?;
+
+        // Roll the conv window in place: new = [old[1..], x_t].
+        let qkv_t = qkv.t()?.contiguous()?; // [conv_dim, 1]
+        let prev = cbuf.narrow(1, 1, self.conv_kernel - 1)?;
+        let padded = Tensor::cat(&[&prev, &qkv_t], 1)?.contiguous()?; // [conv_dim, kernel]
+        candle_nn::fused::static_decode::copy_into(&cbuf, &padded)?;
+        let mut conv = padded
+            .narrow(1, self.conv_kernel - 1, 1)?
+            .broadcast_mul(&self.conv1d_weight.narrow(1, self.conv_kernel - 1, 1)?)?;
+        for j in 0..self.conv_kernel - 1 {
+            conv = (conv
+                + padded
+                    .narrow(1, j, 1)?
+                    .broadcast_mul(&self.conv1d_weight.narrow(1, j, 1)?)?)?;
+        }
+        let conved = silu_f32(&conv)?.t()?.contiguous()?; // [1, conv_dim]
+
+        let q = conved.narrow(1, 0, key_dim)?.reshape((1, self.n_k_heads, self.d_k))?;
+        let k = conved
+            .narrow(1, key_dim, key_dim)?
+            .reshape((1, self.n_k_heads, self.d_k))?;
+        let v = conved
+            .narrow(1, 2 * key_dim, value_dim)?
+            .reshape((1, self.n_v_heads, self.d_v))?;
+        let q = (l2norm_last(&q)? * (self.d_k as f64).powf(-0.5))?;
+        let k = l2norm_last(&k)?;
+
+        let o = candle_nn::fused::static_decode::gdn_scan(
+            &q.contiguous()?,
+            &k.contiguous()?,
+            &v.contiguous()?,
+            &beta.contiguous()?,
+            &decay.contiguous()?,
+            &sbuf,
+        )?; // [1, n_v, d_v]
+
+        let var = o.sqr()?.mean_keepdim(D::Minus1)?;
+        let o = o.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        let o = o.broadcast_mul(&self.norm_weight.reshape((1, 1, self.d_v))?)?;
+        let zg = silu_f32(&z.reshape((1, self.n_v_heads, self.d_v))?)?;
+        let o = (o * zg)?;
+        let o = o.reshape((1, 1, value_dim))?.to_dtype(dt)?;
+        self.out_proj.forward(&o)
     }
 
     /// Single-token step. x: [b=1, 1, hidden]. All recurrence math in f32.
@@ -745,6 +994,24 @@ impl DecoderLayer {
         })
     }
 
+    fn forward_static(
+        &mut self,
+        x: &Tensor,
+        rotary: &Rotary,
+        pos: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let mixed = match &mut self.mixer {
+            Mixer::Full(a) => a.forward_static(&normed, rotary, pos, mask)?,
+            Mixer::Linear(g) => g.forward_static_step(&normed)?,
+        };
+        let x = (x + mixed)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let f = self.ffn.forward(&normed)?;
+        x + f
+    }
+
     fn forward_step(&mut self, x: &Tensor, rotary: &Rotary, pos: usize) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         if std::env::var("QWEN35_DEBUG_GDN").is_ok() {
@@ -787,6 +1054,15 @@ pub struct Model {
     device: Device,
     /// Absolute position of the next token (recurrent state cursor).
     pos: usize,
+    static_ctx: Option<QwenStaticCtx>,
+}
+
+/// Device-resident state for the shape-static decode path.
+#[derive(Debug, Clone)]
+pub struct QwenStaticCtx {
+    pub pos: Tensor,  // u32 [1]
+    pub mask: Tensor, // f32 additive row [max_seq]
+    pub max_seq: usize,
 }
 
 impl Model {
@@ -855,7 +1131,91 @@ impl Model {
             rotary,
             device: vb.device().clone(),
             pos: 0,
+            static_ctx: None,
         })
+    }
+
+    /// Enable the shape-static decode path (fixed [max_seq] KV budget on the
+    /// full-attention layers; address-stable GDN state buffers).
+    pub fn enable_static_decode(&mut self, max_seq: usize) -> Result<()> {
+        let dtype = self.embed_tokens.embeddings().dtype();
+        let dev = self.device.clone();
+        if self.static_ctx.is_none() {
+            self.static_ctx = Some(QwenStaticCtx {
+                pos: Tensor::zeros(1, DType::U32, &dev)?,
+                mask: Tensor::zeros(max_seq, DType::F32, &dev)?,
+                max_seq,
+            });
+        }
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Full(a) => a.enable_static(max_seq, dtype, &dev)?,
+                Mixer::Linear(g) => g.enable_static(&dev)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub fn static_enabled(&self) -> bool {
+        self.static_ctx.is_some()
+    }
+
+    /// After dynamic prefill: migrate every layer's state into the
+    /// address-stable buffers and set the device position. Returns the
+    /// prefill length.
+    pub fn migrate_prefill_to_static(&mut self) -> Result<usize> {
+        let mut n = 0usize;
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Full(a) => {
+                    let m = a.migrate_kv_to_static()?;
+                    if m > 0 {
+                        n = m;
+                    }
+                }
+                Mixer::Linear(g) => g.migrate_state_to_static()?,
+            }
+        }
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        if n >= ctx.max_seq {
+            candle::bail!("prefill length {n} exceeds static max_seq {}", ctx.max_seq);
+        }
+        // Trust the model cursor over the attention caches (they agree, but
+        // the cursor also counts pure-GDN paths).
+        let n = self.pos.max(n);
+        candle_nn::fused::static_decode::write_u32(&ctx.pos, n as u32)?;
+        Ok(n)
+    }
+
+    /// One graph-replayable decode step: [1,1] token ids -> [1, vocab] logits.
+    pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .clone();
+        candle_nn::fused::static_decode::mask_from_pos(&ctx.mask, &ctx.pos, 0)?;
+        let mut x = self.embed_tokens.forward(input_ids)?;
+        let rotary = self.rotary.clone();
+        for layer in self.layers.iter_mut() {
+            x = layer.forward_static(&x, &rotary, &ctx.pos, &ctx.mask)?;
+        }
+        let x = self.norm.forward(&x)?;
+        let logits = self.lm_head.forward(&x.i((.., 0, ..))?.contiguous()?)?;
+        candle_nn::fused::static_decode::incr_u32(&ctx.pos)?;
+        self.pos += 1; // keep the host cursor coherent for mixed use
+        Ok(logits)
+    }
+
+    /// Rewind static state between requests (never inside a graph).
+    pub fn reset_static(&mut self) -> Result<()> {
+        if let Some(ctx) = self.static_ctx.as_ref() {
+            candle_nn::fused::static_decode::write_u32(&ctx.pos, 0)?;
+        }
+        Ok(())
     }
 
     pub fn clear_kv_cache(&mut self) {
