@@ -360,3 +360,16 @@ extern "C" __global__ void NAME( \
 }
 ARGMAX_OP(float, argmax_feed_f32)
 ARGMAX_OP(__nv_bfloat16, argmax_feed_bf16)
+
+// R-SWA ring-slot advance (Unlimited-OCR): after the warmup region fills,
+// the KV write slot cycles through [prefill, prefill+window). One thread.
+extern "C" __global__ void incr_ring_u32(
+    unsigned int* __restrict__ slot,
+    const unsigned int prefill,
+    const unsigned int window) {
+    unsigned int s = slot[0] + 1;
+    if (s >= prefill + window) {
+        s = prefill;
+    }
+    slot[0] = s;
+}

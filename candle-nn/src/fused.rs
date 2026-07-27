@@ -430,6 +430,30 @@ pub mod static_decode {
     /// ([kv_heads, max_seq, hd]) at rows [pos, pos+t). Eager prefill path:
     /// `pos` is a host value (NOT graph-safe — decode keeps using kv_write
     /// with the device-resident position).
+    /// R-SWA ring-slot advance: `slot = prefill + ((slot - prefill + 1) % window)`
+    /// on a device u32 scalar. Graph-safe (fixed address, one thread).
+    pub fn incr_ring_u32(slot: &Tensor, prefill: u32, window: u32) -> Result<()> {
+        let dev = match slot.device() {
+            candle::Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("incr_ring_u32: CUDA only"),
+        };
+        let func = dev.get_or_load_func("incr_ring_u32", &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ss, so) = cuda_parts(slot)?;
+        with_slice!(ss, so, U32, sp, {
+            let mut b = func.builder();
+            b.arg(&sp);
+            b.arg(&prefill);
+            b.arg(&window);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok(())
+    }
+
     /// On-device greedy sampling: argmax(logits) -> writes token into
     /// `input_buf` (u32 [1,1], self-feeding the next graph replay), appends
     /// to `history` (u32 [cap]) at `step`, and increments `step` (u32 [1]).

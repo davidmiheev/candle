@@ -79,6 +79,13 @@ impl Rotary {
         })
     }
 
+    /// Single-token rope at a DEVICE position (graph-friendly row gather).
+    fn apply_gather(&self, x: &Tensor, pos: &Tensor) -> Result<Tensor> {
+        let cos = self.cos.index_select(pos, 0)?.to_dtype(x.dtype())?;
+        let sin = self.sin.index_select(pos, 0)?.to_dtype(x.dtype())?;
+        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+    }
+
     fn apply(&self, x: &Tensor, pos: usize) -> Result<Tensor> {
         let (_b, _h, seq, _hd) = x.dims4()?;
         let cos = self.cos.narrow(0, pos, seq)?.to_dtype(x.dtype())?;
@@ -99,6 +106,7 @@ struct Attention {
     n_kv_heads: usize,
     head_dim: usize,
     kv_cache: Option<(Tensor, Tensor)>,
+    static_kv: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
@@ -114,11 +122,102 @@ impl Attention {
             n_kv_heads: cfg.num_key_value_heads,
             head_dim: hd,
             kv_cache: None,
+            static_kv: None,
         })
     }
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+    }
+
+    fn enable_static(&mut self, cap: usize, dtype: DType, dev: &Device) -> Result<()> {
+        if self.static_kv.is_none() {
+            let shape = (self.n_kv_heads, cap, self.head_dim);
+            self.static_kv = Some((
+                Tensor::zeros(shape, dtype, dev)?,
+                Tensor::zeros(shape, dtype, dev)?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy the dynamic prefill KV into the fixed buffers; returns seq len.
+    fn migrate_kv_to_static(&mut self) -> Result<usize> {
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("rswa static not enabled".into()))?;
+        let (k, v) = match &self.kv_cache {
+            Some((k, v)) => (k.clone(), v.clone()),
+            None => return Ok(0),
+        };
+        let (_b, h, seq, hd) = k.dims4()?;
+        candle_nn::fused::static_decode::kv_write_chunk(
+            kbuf,
+            &k.reshape((h, seq, hd))?.contiguous()?,
+            0,
+        )?;
+        candle_nn::fused::static_decode::kv_write_chunk(
+            vbuf,
+            &v.reshape((h, seq, hd))?.contiguous()?,
+            0,
+        )?;
+        self.kv_cache = None;
+        Ok(seq)
+    }
+
+    /// R-SWA single-token step: rope at the TRUE (monotonic) device
+    /// position, KV written at the ring slot, attention over the fixed
+    /// buffer with a validity mask. MHA (heads == kv_heads).
+    fn forward_static(
+        &mut self,
+        x: &Tensor, // [1, 1, hidden]
+        rotary: &Rotary,
+        rope_pos: &Tensor,
+        write_slot: &Tensor,
+        mask: &Tensor, // f32 [cap]
+    ) -> Result<Tensor> {
+        let hd = self.head_dim;
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("rswa static not enabled".into()))?
+            .clone();
+        let cap = kbuf.dim(1)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((1, 1, self.n_heads, hd))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((1, 1, self.n_kv_heads, hd))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((1, 1, self.n_kv_heads, hd))?;
+        let q = rotary.apply_gather(&q, rope_pos)?;
+        let k = rotary.apply_gather(&k, rope_pos)?;
+        candle_nn::fused::static_decode::kv_write(
+            &kbuf,
+            &vbuf,
+            &k.reshape((self.n_kv_heads, 1, hd))?.contiguous()?,
+            &v.reshape((self.n_kv_heads, 1, hd))?.contiguous()?,
+            write_slot,
+        )?;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let att = (q.contiguous()?.matmul(&kbuf.unsqueeze(0)?.transpose(2, 3)?.contiguous()?)?
+            * scale)?; // [1, h, 1, cap]
+        let att = att
+            .to_dtype(DType::F32)?
+            .broadcast_add(&mask.reshape((1, 1, 1, cap))?)?;
+        let att = candle_nn::ops::softmax_last_dim(&att)?.to_dtype(q.dtype())?;
+        let out = att.matmul(&vbuf.unsqueeze(0)?.contiguous()?)?; // [1, h, 1, hd]
+        out.transpose(1, 2)?
+            .reshape((1, 1, self.n_heads * hd))?
+            .apply(&self.o_proj)
     }
 
     fn forward(&mut self, x: &Tensor, rotary: &Rotary, pos: usize) -> Result<Tensor> {
@@ -341,6 +440,19 @@ impl DecoderLayer {
     }
 }
 
+/// Device-resident R-SWA decode state.
+#[derive(Debug, Clone)]
+pub struct RswaCtx {
+    pub rope_pos: Tensor,   // u32 [1] — true monotonic position
+    pub write_slot: Tensor, // u32 [1] — ring slot in [prefill, prefill+W)
+    pub mask: Tensor,       // f32 [cap] validity row
+    pub valid: Tensor,      // u32 [1] — (valid_len - 1) for mask_from_pos
+    pub prefill_len: usize,
+    pub window: usize,
+    pub cap: usize,
+    pub dec_steps: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextModel {
     embed_tokens: Embedding,
@@ -350,6 +462,7 @@ pub struct TextModel {
     rotary: Rotary,
     pub device: Device,
     pub dtype: DType,
+    rswa: Option<RswaCtx>,
 }
 
 impl TextModel {
@@ -368,6 +481,7 @@ impl TextModel {
             rotary: Rotary::new(cfg, vb.device())?,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            rswa: None,
         })
     }
 
@@ -390,6 +504,105 @@ impl TextModel {
     pub fn forward(&mut self, input_ids: &Tensor, pos: usize) -> Result<Tensor> {
         let xs = self.embed(input_ids)?;
         self.forward_embeds(&xs, pos)
+    }
+
+    /// Enable R-SWA static decode: fixed [prefill_cap + window] KV buffers.
+    pub fn enable_static_rswa(&mut self, prefill_cap: usize, window: usize) -> Result<()> {
+        let cap = prefill_cap + window;
+        let dtype = self.dtype;
+        let dev = self.device.clone();
+        if self.rswa.is_none() {
+            self.rswa = Some(RswaCtx {
+                rope_pos: Tensor::zeros(1, DType::U32, &dev)?,
+                write_slot: Tensor::zeros(1, DType::U32, &dev)?,
+                mask: Tensor::zeros(cap, DType::F32, &dev)?,
+                valid: Tensor::zeros(1, DType::U32, &dev)?,
+                prefill_len: 0,
+                window,
+                cap,
+                dec_steps: 0,
+            });
+        }
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.enable_static(cap, dtype, &dev)?;
+        }
+        Ok(())
+    }
+
+    /// After dynamic prefill: copy KV into the fixed buffers, set device
+    /// cursors, build the initial validity mask.
+    pub fn migrate_prefill_to_static(&mut self) -> Result<usize> {
+        let mut n = 0usize;
+        for layer in self.layers.iter_mut() {
+            let m = layer.self_attn.migrate_kv_to_static()?;
+            if m > 0 {
+                n = m;
+            }
+        }
+        let ctx = self
+            .rswa
+            .as_mut()
+            .ok_or_else(|| candle::Error::Msg("rswa not enabled".into()))?;
+        if n + ctx.window > ctx.cap {
+            candle::bail!("prefill {n} + window {} exceeds capacity {}", ctx.window, ctx.cap);
+        }
+        ctx.prefill_len = n;
+        ctx.dec_steps = 0;
+        use candle_nn::fused::static_decode as sd;
+        sd::write_u32(&ctx.rope_pos, n as u32)?;
+        sd::write_u32(&ctx.write_slot, n as u32)?;
+        sd::write_u32(&ctx.valid, n.saturating_sub(1) as u32)?;
+        sd::mask_from_pos(&ctx.mask, &ctx.valid, 0)?;
+        Ok(n)
+    }
+
+    /// One R-SWA decode step over embeddings [1,1,hidden] -> [1, vocab].
+    /// Warmup (first `window` steps) appends; steady state ring-overwrites —
+    /// decode cost is constant in output length either way.
+    pub fn forward_static_embeds(&mut self, xs: &Tensor) -> Result<Tensor> {
+        let ctx = self
+            .rswa
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("rswa not enabled".into()))?
+            .clone();
+        use candle_nn::fused::static_decode as sd;
+        // Validity grows by one per step until prefill + window is reached.
+        let valid_len = (ctx.prefill_len + ctx.dec_steps + 1).min(ctx.prefill_len + ctx.window);
+        sd::write_u32(&ctx.valid, (valid_len - 1) as u32)?;
+        sd::mask_from_pos(&ctx.mask, &ctx.valid, 0)?;
+        let rotary = self.rotary.clone();
+        let mut x = xs.clone();
+        for layer in self.layers.iter_mut() {
+            let residual = x.clone();
+            let h = layer.self_attn.forward_static(
+                &layer.input_layernorm.forward(&x)?,
+                &rotary,
+                &ctx.rope_pos,
+                &ctx.write_slot,
+                &ctx.mask,
+            )?;
+            let xr = (&residual + h)?;
+            let f = layer.ffn.forward(&layer.post_attention_layernorm.forward(&xr)?)?;
+            x = (xr + f)?;
+        }
+        let x = self.norm.forward(&x)?;
+        let logits = self.lm_head.forward(&x.i((.., 0, ..))?.contiguous()?)?;
+        // Advance cursors: rope monotonic; write slot rings after warmup.
+        sd::incr_u32(&ctx.rope_pos)?;
+        sd::incr_ring_u32(&ctx.write_slot, ctx.prefill_len as u32, ctx.window as u32)?;
+        if let Some(c) = self.rswa.as_mut() {
+            c.dec_steps += 1;
+        }
+        Ok(logits)
+    }
+
+    pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let xs = self.embed(input_ids)?;
+        self.forward_static_embeds(&xs)
+    }
+
+    pub fn rswa_enabled(&self) -> bool {
+        self.rswa.is_some()
     }
 
     pub fn clear_kv_cache(&mut self) {
