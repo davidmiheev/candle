@@ -2,4 +2,6 @@
 //! Text decoder in `text`; vision towers (SAM-ViT-B + CLIP-L) and the
 //! R-SWA static path land in follow-up modules.
 pub mod text;
+pub mod vision;
 pub use text::{TextModel, UnlimitedOcrTextConfig};
+pub use vision::DeepEncoder;
