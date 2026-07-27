@@ -107,12 +107,6 @@ impl ClipTower {
     fn forward(&self, patch_embeds: &Tensor) -> Result<Tensor> {
         let (b, c, gh, gw) = patch_embeds.dims4()?;
         let seq = gh * gw;
-        if seq + 1 != self.position_embedding.dim(0)? {
-            candle::bail!(
-                "clip tower v1 expects the native {} patch grid, got {seq}",
-                self.position_embedding.dim(0)? - 1
-            );
-        }
         let pe = patch_embeds
             .reshape((b, c, seq))?
             .transpose(1, 2)?; // [b, seq, c]
@@ -122,10 +116,9 @@ impl ClipTower {
             .expand((b, 1, c))?
             .to_dtype(pe.dtype())?;
         let x = Tensor::cat(&[cls, pe], 1)?;
-        let pos = self
-            .position_embedding
-            .to_dtype(x.dtype())?
-            .reshape((1, seq + 1, c))?;
+        let pos_native = self.position_embedding.reshape((1, (), c))?;
+        let pos = interp_pos_with_cls(&pos_native, gh)?
+            .to_dtype(x.dtype())?;
         let x = x.broadcast_add(&pos)?;
         let mut x = self.pre_ln.forward(&x)?;
         for blk in self.blocks.iter() {
@@ -234,3 +227,25 @@ impl DeepEncoder {
 }
 
 use candle::D::Minus1 as D_MINUS1;
+
+
+// Position-grid interpolation: shared torch-bicubic-antialias core lives in
+// models::interpolation; this wrapper handles the cls-token-carrying CLIP
+// layout [1, src*src+1, dim].
+pub(crate) fn interp_pos_with_cls(pos: &Tensor, tgt_grid: usize) -> Result<Tensor> {
+    let (one, n, dim) = pos.dims3()?;
+    let src = ((n - 1) as f64).sqrt() as usize;
+    if src * src + 1 != n || one != 1 {
+        candle::bail!("unexpected pos shape {:?}", pos.dims());
+    }
+    if src == tgt_grid {
+        return Ok(pos.clone());
+    }
+    let f = pos.to_dtype(DType::F32)?;
+    let cls: Vec<f32> = f.i((0, 0, ..))?.to_vec1()?;
+    let body: Vec<f32> = f.i((0, 1.., ..))?.flatten_all()?.to_vec1()?;
+    let resized = crate::models::interpolation::resize_grid_f32(&body, src, tgt_grid, dim);
+    let mut all = cls;
+    all.extend(resized);
+    Tensor::from_vec(all, (1, tgt_grid * tgt_grid + 1, dim), pos.device())?.to_dtype(pos.dtype())
+}

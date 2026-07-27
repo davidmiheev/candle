@@ -111,6 +111,7 @@ pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3;
 pub mod qwen3_5;
+pub mod interpolation;
 pub mod unlimited_ocr;
 pub mod qwen3_moe;
 pub mod qwen3_vl;
