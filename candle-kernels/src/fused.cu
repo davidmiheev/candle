@@ -373,3 +373,39 @@ extern "C" __global__ void incr_ring_u32(
     }
     slot[0] = s;
 }
+
+// A5 fused-MoE building block 1: device-side greedy top-k gating for
+// DSv2-Lite-class routers (n_experts <= 64, k <= 8). Softmax over f32 gate
+// logits then greedy top-k with LOWEST-INDEX tie-breaking (torch.topk
+// first-occurrence semantics). One block, n_experts threads; seq = 1.
+// Outputs: idx[k] (u32 expert ids), w[k] (f32 gate probabilities).
+extern "C" __global__ void moe_topk_gate_f32(
+    const float* __restrict__ logits, // [n]
+    unsigned int* __restrict__ idx,   // [k]
+    float* __restrict__ w,            // [k]
+    const int n,
+    const int k) {
+    __shared__ float probs[64];
+    __shared__ float smax[64];
+    int t = threadIdx.x;
+    // softmax (n <= 64: single-block reduction, serial by thread 0 is fine
+    // at this size and keeps the tie semantics trivially exact)
+    if (t == 0) {
+        float mx = logits[0];
+        for (int i = 1; i < n; ++i) mx = fmaxf(mx, logits[i]);
+        float denom = 0.f;
+        for (int i = 0; i < n; ++i) { probs[i] = expf(logits[i] - mx); denom += probs[i]; }
+        for (int i = 0; i < n; ++i) probs[i] /= denom;
+        for (int i = 0; i < n; ++i) smax[i] = probs[i];
+        for (int j = 0; j < k; ++j) {
+            int best = 0;
+            float bv = -1.f;
+            for (int i = 0; i < n; ++i) {
+                if (smax[i] > bv) { bv = smax[i]; best = i; } // strict > keeps lowest index on ties
+            }
+            idx[j] = (unsigned int)best;
+            w[j] = probs[best];
+            smax[best] = -2.f;
+        }
+    }
+}
