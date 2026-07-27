@@ -204,6 +204,58 @@ impl DeepEncoder {
         self.assemble(&f1, &f2)
     }
 
+    /// Crop mode (their default for large images): global 1024 view + local
+    /// 640 crops in a (width_crop_num x height_crop_num) grid. Feature order
+    /// mirrors the reference exactly: [locals mosaic, global, separator].
+    /// Locals: per-crop 10x10 grids arranged into an (hc*10, wc*10) mosaic
+    /// (crop-row major), one image_newline per mosaic row.
+    pub fn forward_crops(
+        &self,
+        global_img: &Tensor, // [1, 3, 1024, 1024]
+        crops: &Tensor,      // [n, 3, 640, 640], n = wc * hc, row-major tiles
+        wc: usize,
+        hc: usize,
+    ) -> Result<Tensor> {
+        let global = self.forward(global_img)?; // [273, d] = grid+newline+sep
+        let (g_len, d) = global.dims2()?;
+        let global_body = global.i((..g_len - 1, ..))?; // strip separator
+        let sep = global.i((g_len - 1.., ..))?;
+
+        // Locals through the towers (chunked to bound activation memory).
+        let n = crops.dim(0)?;
+        let mut feats = Vec::new();
+        let chunk = 8usize;
+        let mut i = 0;
+        while i < n {
+            let m = chunk.min(n - i);
+            let part = crops.narrow(0, i, m)?;
+            let f1 = self.sam.forward(&part)?;
+            let f1 = self.net_3.forward(&self.net_2.forward(&f1)?)?; // [m, d1, 10, 10]
+            let f2 = self.clip.forward(&f1)?; // [m, 101, 1024]
+            let (b, c, gh, gw) = f1.dims4()?;
+            let sam_seq = f1.reshape((b, c, gh * gw))?.transpose(1, 2)?;
+            let merged = Tensor::cat(&[f2.i((.., 1.., ..))?, sam_seq], 2)?;
+            feats.push(self.projector.forward(&merged)?); // [m, 100, d]
+            i += m;
+        }
+        let local = Tensor::cat(&feats, 0)?; // [n, 100, d]
+        let g2 = local.dim(1)?;
+        let gsz = (g2 as f64).sqrt() as usize; // 10
+        // (hc, wc, g, g, d) -> permute(0,2,1,3,4) -> (hc*g, wc*g, d)
+        let mosaic = local
+            .reshape((hc, wc, gsz, gsz, d))?
+            .permute((0, 2, 1, 3, 4))?
+            .reshape((hc * gsz, wc * gsz, d))?;
+        let newline = self
+            .image_newline
+            .to_dtype(mosaic.dtype())?
+            .reshape((1, 1, d))?
+            .expand((hc * gsz, 1, d))?;
+        let mosaic = Tensor::cat(&[mosaic, newline], 1)?; // [hc*g, wc*g+1, d]
+        let local_flat = mosaic.reshape((hc * gsz * (wc * gsz + 1), d))?;
+        Tensor::cat(&[local_flat, global_body, sep], 0)
+    }
+
     fn assemble(&self, f1: &Tensor, f2: &Tensor) -> Result<Tensor> {
         let (b, c, gh, gw) = f1.dims4()?;
         let sam_seq = f1.reshape((b, c, gh * gw))?.transpose(1, 2)?; // [b, 256, 1024]
