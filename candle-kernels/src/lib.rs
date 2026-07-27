@@ -1,6 +1,10 @@
 mod ptx {
     include!(concat!(env!("OUT_DIR"), "/ptx.rs"));
 }
+mod images {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/images.rs"));
+}
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +41,7 @@ pub const ALL_IDS: [Id; 12] = [
 pub struct Module {
     index: usize,
     ptx: &'static str,
+    image: Option<&'static [u8]>,
 }
 
 impl Module {
@@ -46,6 +51,13 @@ impl Module {
 
     pub fn ptx(&self) -> &'static str {
         self.ptx
+    }
+
+    /// Precompiled SASS (cubin) for this module when the crate was built
+    /// with CANDLE_CUBIN=1; loaders should prefer it over PTX to skip
+    /// driver JIT.
+    pub fn image(&self) -> Option<&'static [u8]> {
+        self.image
     }
 }
 
@@ -65,6 +77,7 @@ macro_rules! mdl {
         pub const $cst: Module = Module {
             index: module_index(Id::$id),
             ptx: ptx::$cst,
+            image: images::$cst,
         };
     };
 }
