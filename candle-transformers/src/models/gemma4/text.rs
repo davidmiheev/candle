@@ -696,6 +696,19 @@ pub struct StaticCtx {
     pub mask_sliding: Tensor, // f32 [max_seq]
     pub max_seq: usize,
     pub sliding_window: usize,
+    /// A2 chunked-prefill-graph state (allocated by enable_chunk_graph).
+    pub chunk: Option<ChunkCtx>,
+}
+
+/// Device-resident chunked-prefill state: everything a captured prefill
+/// chunk step reads or advances.
+#[derive(Debug, Clone)]
+pub struct ChunkCtx {
+    pub ids: Tensor,          // u32 [1, C] — fed between replays (htod)
+    pub rope_idx: Tensor,     // u32 [C] — iota(pos) refreshed in-graph
+    pub mask_global: Tensor,  // f32 [C, max_seq]
+    pub mask_sliding: Tensor, // f32 [C, max_seq]
+    pub chunk: usize,
 }
 
 impl StaticCtx {
@@ -706,6 +719,7 @@ impl StaticCtx {
             mask_sliding: Tensor::zeros(max_seq, DType::F32, dev)?,
             max_seq,
             sliding_window,
+            chunk: None,
         })
     }
 
@@ -1091,6 +1105,118 @@ impl Attention {
             .apply(&self.o_proj)
     }
 
+    /// A2: chunk attention with EVERY positional input device-resident
+    /// (rope indices, masks, kv offsets from ChunkCtx/StaticCtx) and all
+    /// shapes fixed at the chunk size => replayable inside a captured graph.
+    fn forward_static_chunk_dev(
+        &mut self,
+        xs: &Tensor, // [1, C, hidden]
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+    ) -> Result<Tensor> {
+        let (b_sz, t_len, _) = xs.dims3()?;
+        debug_assert_eq!(b_sz, 1);
+        let cctx = ctx
+            .chunk
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("chunk graph not enabled".into()))?;
+
+        let rope_gather = |x: &Tensor, cos: &Tensor, sin: &Tensor| -> Result<Tensor> {
+            let cos_p = cos.index_select(&cctx.rope_idx, 0)?; // [C, half]
+            let sin_p = sin.index_select(&cctx.rope_idx, 0)?;
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos_p, &sin_p)
+        };
+        let (cos_t, sin_t) = if self.is_sliding {
+            (&self.rotary_emb_local.cos, &self.rotary_emb_local.sin)
+        } else {
+            (&self.rotary_emb_global.cos, &self.rotary_emb_global.sin)
+        };
+
+        let q = self.q_proj.forward(xs)?;
+        let q = q
+            .reshape((1, t_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q = self.q_norm.forward(&q)?;
+
+        let (kbuf, vbuf, q) = if self.is_kv_shared {
+            let q = rope_gather(&q, cos_t, sin_t)?;
+            let slot = if self.is_sliding {
+                shared_kv.sliding.as_ref()
+            } else {
+                shared_kv.full.as_ref()
+            };
+            let (k, v) = slot.ok_or_else(|| {
+                candle::Error::Msg("kv-shared layer ran before any storing layer".to_string())
+            })?;
+            (k.clone(), v.clone(), q)
+        } else {
+            let k_proj = self.k_proj.as_ref().expect("non-shared layer has k_proj");
+            let k_norm = self.k_norm.as_ref().expect("non-shared layer has k_norm");
+            let k_raw = k_proj
+                .forward(xs)?
+                .reshape((1, t_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v_raw = match self.v_proj.as_ref() {
+                Some(v_proj) => v_proj
+                    .forward(xs)?
+                    .reshape((1, t_len, self.num_kv_heads, self.head_dim))?
+                    .transpose(1, 2)?,
+                None => k_raw.clone(),
+            };
+            let k = k_norm.forward(&k_raw)?;
+            let v = v_norm(&v_raw, self.rms_norm_eps)?;
+            let q = rope_gather(&q, cos_t, sin_t)?;
+            let k = rope_gather(&k, cos_t, sin_t)?;
+
+            if self.static_kv.is_none() {
+                let dev = xs.device();
+                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
+                self.static_kv = Some((
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                    Tensor::zeros(shape, xs.dtype(), dev)?,
+                ));
+            }
+            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            let kc = k
+                .reshape((self.num_kv_heads, t_len, self.head_dim))?
+                .contiguous()?;
+            let vc = v
+                .reshape((self.num_kv_heads, t_len, self.head_dim))?
+                .contiguous()?;
+            candle_nn::fused::static_decode::kv_write_chunk_at(kbuf, &kc, &ctx.pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk_at(vbuf, &vc, &ctx.pos)?;
+            if self.store_full_length_kv {
+                let slot = if self.is_sliding {
+                    &mut shared_kv.sliding
+                } else {
+                    &mut shared_kv.full
+                };
+                *slot = Some((kbuf.clone(), vbuf.clone()));
+            }
+            (kbuf.clone(), vbuf.clone(), q)
+        };
+
+        // Fixed-shape attention over the FULL KV extent with the 2D device
+        // chunk mask (rows = chunk, cols = capacity).
+        let kfull = kbuf.unsqueeze(0)?; // [1, kvh, cap, hd]
+        let vfull = vbuf.unsqueeze(0)?;
+        let kfull = crate::utils::repeat_kv(kfull, self.num_kv_groups)?.contiguous()?;
+        let vfull = crate::utils::repeat_kv(vfull, self.num_kv_groups)?.contiguous()?;
+        let mask = if self.is_sliding {
+            &cctx.mask_sliding
+        } else {
+            &cctx.mask_global
+        };
+        let attn = q.contiguous()?.matmul(&kfull.transpose(2, 3)?)?; // [1,h,C,cap]
+        let attn = attn.to_dtype(DType::F32)?;
+        let attn = attn.broadcast_add(&mask.reshape((1, 1, t_len, ctx.max_seq))?)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?.to_dtype(q.dtype())?;
+        let out = attn.matmul(&vfull)?;
+        out.transpose(1, 2)?
+            .reshape((1, t_len, ()))?
+            .apply(&self.o_proj)
+    }
+
     /// One-token attention over the full preallocated KV extent, indexed by
     /// the device position scalar. Shape/address-static: replayable inside a
     /// captured CUDA graph.
@@ -1465,6 +1591,47 @@ impl DecoderLayer {
     /// One-token, shape-static step (graph-replayable): identical math to
     /// [`Self::forward`] with the attention going through the preallocated
     /// KV buffers and the device-side position/mask context.
+    fn forward_static_chunk_dev(
+        &mut self,
+        xs: &Tensor, // [1, C, hidden]
+        per_layer_input: Option<&Tensor>,
+        ctx: &StaticCtx,
+        shared_kv: &mut SharedKvStates,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward_static_chunk_dev(&xs, ctx, shared_kv)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?;
+        let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
+            &xs,
+            residual,
+            &self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps as f32,
+            false,
+        )?;
+        let residual = &xs_res;
+        let xs = ffw_in.apply(&self.mlp)?;
+        let xs = match self.moe.as_ref() {
+            Some(moe) => moe.forward(&xs, residual)?,
+            None => xs,
+        };
+        let xs = xs.apply(&self.post_feedforward_layernorm)?;
+        let mut xs = (residual + xs)?;
+        if let (Some(gate), Some(proj), Some(norm), Some(pli)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let residual = &xs;
+            let gated = xs.apply(gate)?.apply(&self.act_fn)?;
+            let mixed = (gated * pli)?;
+            let projected = mixed.apply(proj)?.apply(norm)?;
+            xs = (residual + projected)?;
+        }
+        Ok(xs)
+    }
+
     fn forward_static_chunk(
         &mut self,
         xs: &Tensor, // [1, T, hidden]
@@ -1896,6 +2063,137 @@ impl TextModel {
     /// batched attention, leaving the device position at prompt length and
     /// returning last-position logits. Replaces token-stepped static prefill
     /// (which measured ~64x slower on 1.6k-token prompts).
+    /// Rewind the device position cursor to zero (prefill-graph capture).
+    pub fn reset_static_pos(&mut self) -> Result<()> {
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        candle_nn::fused::static_decode::write_u32(&ctx.pos, 0)
+    }
+
+    /// The device position cursor (u32 [1]).
+    pub fn static_pos(&self) -> Result<&Tensor> {
+        Ok(&self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .pos)
+    }
+
+    /// A2: allocate the device-resident chunk state for graphed prefill.
+    pub fn enable_chunk_graph(&mut self, chunk: usize) -> Result<()> {
+        let ctx = self
+            .static_ctx
+            .as_mut()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        if ctx.chunk.is_none() {
+            let dev = self.device.clone();
+            ctx.chunk = Some(ChunkCtx {
+                ids: Tensor::zeros((1, chunk), DType::U32, &dev)?,
+                rope_idx: Tensor::zeros(chunk, DType::U32, &dev)?,
+                mask_global: Tensor::zeros((chunk, ctx.max_seq), DType::F32, &dev)?,
+                mask_sliding: Tensor::zeros((chunk, ctx.max_seq), DType::F32, &dev)?,
+                chunk,
+            });
+        }
+        Ok(())
+    }
+
+    /// A2: one full prefill chunk step reading ONLY device state — the body
+    /// that gets captured into a CUDA graph. Refreshes rope indices and
+    /// chunk masks from the position cursor, runs all layers, advances the
+    /// cursor by the chunk size, and returns the last row's hidden->logits.
+    pub fn prefill_chunk_step(&mut self) -> Result<(Tensor, Tensor)> {
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .clone();
+        let cctx = ctx
+            .chunk
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("chunk graph not enabled".into()))?;
+        use candle_nn::fused::static_decode as sd;
+        sd::iota_add_u32(&cctx.rope_idx, &ctx.pos)?;
+        sd::chunk_mask_from_pos(&cctx.mask_global, &ctx.pos, None)?;
+        sd::chunk_mask_from_pos(&cctx.mask_sliding, &ctx.pos, Some(ctx.sliding_window))?;
+        let ids = cctx.ids.clone();
+        let xs = self.embed_tokens(&ids)?;
+        let per_layer_inputs = self.per_layer_inputs(&ids, &xs)?;
+        let mut shared_kv = SharedKvStates::default();
+        let mut xs = xs;
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let pli = match per_layer_inputs.as_ref() {
+                Some(p) => Some(p.i((.., .., layer_idx, ..))?),
+                None => None,
+            };
+            xs = layer.forward_static_chunk_dev(&xs, pli.as_ref(), &ctx, &mut shared_kv)?;
+        }
+        sd::incr_add_u32(&ctx.pos, cctx.chunk as u32)?;
+        // Return the full chunk hidden (cheap) + row C-1 logits; when the
+        // final chunk is padded the driver derives logits from the REAL last
+        // row of the hidden instead.
+        let last = xs.narrow(1, cctx.chunk - 1, 1)?;
+        let logits = self.logits_from_hidden(&last)?;
+        Ok((xs, logits))
+    }
+
+    /// norm + lm_head (+softcap) on a [1, n, hidden] slice.
+    pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
+        match self.final_logit_softcapping {
+            None => Ok(logits),
+            Some(sc) => Ok(((logits / sc)?.tanh()? * sc)?),
+        }
+    }
+
+    /// A2 driver (eager form; exp1 captures prefill_chunk_step and replays):
+    /// pad the prompt to a chunk multiple, feed chunk ids between steps,
+    /// then pin the cursor to the REAL length so padded KV rows fall outside
+    /// every subsequent mask.
+    pub fn prefill_static_graph(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let (_b, total) = input_ids.dims2()?;
+        let chunk = {
+            let ctx = self
+                .static_ctx
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+            ctx.chunk
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("chunk graph not enabled".into()))?
+                .chunk
+        };
+        let n_chunks = total.div_ceil(chunk);
+        let mut ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        ids.resize(n_chunks * chunk, 0);
+        let mut last: Option<(Tensor, Tensor)> = None;
+        for c in 0..n_chunks {
+            self.feed_chunk_ids(&ids[c * chunk..(c + 1) * chunk])?;
+            last = Some(self.prefill_chunk_step()?);
+        }
+        // Pin cursor to the real length: padding rows now sit beyond every
+        // subsequent validity mask (decode masks come from ctx.pos).
+        let ctx = self.static_ctx.as_ref().unwrap();
+        candle_nn::fused::static_decode::write_u32(&ctx.pos, total as u32)?;
+        let (hidden, logits_row) = last.ok_or_else(|| candle::Error::Msg("empty prompt".into()))?;
+        let pad = n_chunks * chunk - total;
+        if pad == 0 {
+            Ok(logits_row)
+        } else {
+            let real = hidden.narrow(1, chunk - 1 - pad, 1)?;
+            self.logits_from_hidden(&real)
+        }
+    }
+
+    /// Host->device feed of the next chunk's token ids (between replays).
+    pub fn feed_chunk_ids(&mut self, ids: &[u32]) -> Result<()> {
+        let ctx = self.static_ctx.as_ref().unwrap();
+        let cctx = ctx.chunk.as_ref().unwrap();
+        let src = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &self.device)?;
+        candle_nn::fused::static_decode::copy_into(&cctx.ids, &src)
+    }
+
     pub fn prefill_static_chunked(&mut self, input_ids: &Tensor) -> Result<Tensor> {
         let (_b, total) = input_ids.dims2()?;
         if self.static_ctx.is_none() {

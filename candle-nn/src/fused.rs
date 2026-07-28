@@ -430,6 +430,222 @@ pub mod static_decode {
     /// ([kv_heads, max_seq, hd]) at rows [pos, pos+t). Eager prefill path:
     /// `pos` is a host value (NOT graph-safe — decode keeps using kv_write
     /// with the device-resident position).
+    /// A5 gathered-expert gate/up GEMV: h[j,i] = silu(Wg[e_j,i]·x)·(Wu[e_j,i]·x).
+    pub fn moe_gemv_gateup(
+        wg: &Tensor,  // [E, I, H] bf16
+        wu: &Tensor,  // [E, I, H] bf16
+        x: &Tensor,   // [H] bf16
+        idx: &Tensor, // [k] u32
+        h: &Tensor,   // [k, I] bf16 (out)
+    ) -> Result<()> {
+        let dev = cuda_dev(x)?;
+        let (_e, inter, hidden) = wg.dims3()?;
+        let (k, i2) = h.dims2()?;
+        if i2 != inter {
+            candle::bail!("moe_gemv_gateup: inter mismatch");
+        }
+        let func = dev.get_or_load_func("moe_gemv_gateup_bf16", &kernels::FUSED)?;
+        let warps = k * inter;
+        let cfg = LaunchConfig {
+            grid_dim: (((warps * 32 + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (gs, go) = cuda_parts(wg)?;
+        let (us, uo) = cuda_parts(wu)?;
+        let (xs, xo) = cuda_parts(x)?;
+        let (is, io) = cuda_parts(idx)?;
+        let (hs, ho) = cuda_parts(h)?;
+        with_slice!(gs, go, BF16, gp, {
+            with_slice!(us, uo, BF16, up, {
+                with_slice!(xs, xo, BF16, xp, {
+                    with_slice!(is, io, U32, ip, {
+                        with_slice!(hs, ho, BF16, hp, {
+                            let (i_i, h_i) = (inter as i32, hidden as i32);
+                            let mut b = func.builder();
+                            b.arg(&gp);
+                            b.arg(&up);
+                            b.arg(&xp);
+                            b.arg(&ip);
+                            b.arg(&hp);
+                            b.arg(&i_i);
+                            b.arg(&h_i);
+                            unsafe { b.launch(cfg) }.w()?;
+                        });
+                    });
+                });
+            });
+        });
+        Ok(())
+    }
+
+    /// A5 gathered-expert down GEMV with gate weights: y = Σ w_j·Wd[e_j]·h_j.
+    pub fn moe_gemv_down(
+        wd: &Tensor,  // [E, H, I] bf16
+        h: &Tensor,   // [k, I] bf16
+        idx: &Tensor, // [k] u32
+        w: &Tensor,   // [k] f32
+        y: &Tensor,   // [H] bf16 (out)
+    ) -> Result<()> {
+        let dev = cuda_dev(y)?;
+        let (_e, hidden, inter) = wd.dims3()?;
+        let (k, _i) = h.dims2()?;
+        let func = dev.get_or_load_func("moe_gemv_down_bf16", &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (((hidden * 32 + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ds, do_) = cuda_parts(wd)?;
+        let (hs, ho) = cuda_parts(h)?;
+        let (is, io) = cuda_parts(idx)?;
+        let (ws, wo) = cuda_parts(w)?;
+        let (ys, yo) = cuda_parts(y)?;
+        with_slice!(ds, do_, BF16, dp, {
+            with_slice!(hs, ho, BF16, hp, {
+                with_slice!(is, io, U32, ip, {
+                    with_slice!(ws, wo, F32, wp, {
+                        with_slice!(ys, yo, BF16, yp, {
+                            let (k_i, i_i, h_i) = (k as i32, inter as i32, hidden as i32);
+                            let mut b = func.builder();
+                            b.arg(&dp);
+                            b.arg(&hp);
+                            b.arg(&ip);
+                            b.arg(&wp);
+                            b.arg(&yp);
+                            b.arg(&k_i);
+                            b.arg(&i_i);
+                            b.arg(&h_i);
+                            unsafe { b.launch(cfg) }.w()?;
+                        });
+                    });
+                });
+            });
+        });
+        Ok(())
+    }
+
+    fn cuda_dev(t: &Tensor) -> Result<candle::CudaDevice> {
+        match t.device() {
+            candle::Device::Cuda(d) => Ok(d.clone()),
+            _ => candle::bail!("fused kernels are CUDA-only"),
+        }
+    }
+
+    /// pos += delta on a device u32 scalar (in-graph chunk advance).
+    pub fn incr_add_u32(pos: &Tensor, delta: u32) -> Result<()> {
+        let dev = cuda_dev(pos)?;
+        let func = dev.get_or_load_func("incr_add_u32", &kernels::FUSED)?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(ps, po, U32, pp, {
+            let mut b = func.builder();
+            b.arg(&pp);
+            b.arg(&delta);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok(())
+    }
+
+    /// out[i] = pos + i (per-token rope positions of a chunk).
+    pub fn iota_add_u32(out: &Tensor, pos: &Tensor) -> Result<()> {
+        let dev = cuda_dev(out)?;
+        let n = out.elem_count();
+        let func = dev.get_or_load_func("iota_add_u32", &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (((n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (os, oo) = cuda_parts(out)?;
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(os, oo, U32, op, {
+            with_slice!(ps, po, U32, pp, {
+                let n_i = n as i32;
+                let mut b = func.builder();
+                b.arg(&op);
+                b.arg(&pp);
+                b.arg(&n_i);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
+    /// Causal chunk mask [rows, cap] from a device position scalar.
+    pub fn chunk_mask_from_pos(mask: &Tensor, pos: &Tensor, window: Option<usize>) -> Result<()> {
+        let dev = cuda_dev(mask)?;
+        let (rows, cap) = mask.dims2()?;
+        let name = if window.is_some() {
+            "chunk_mask_window_from_pos_f32"
+        } else {
+            "chunk_mask_from_pos_f32"
+        };
+        let func = dev.get_or_load_func(name, &kernels::FUSED)?;
+        let n = rows * cap;
+        let cfg = LaunchConfig {
+            grid_dim: (((n + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ms, mo) = cuda_parts(mask)?;
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(ms, mo, F32, mp, {
+            with_slice!(ps, po, U32, pp, {
+                let rows_i = rows as i32;
+                let cap_i = cap as i32;
+                let win_i = window.map(|w| w as i32);
+                let mut b = func.builder();
+                b.arg(&mp);
+                b.arg(&pp);
+                b.arg(&rows_i);
+                b.arg(&cap_i);
+                if let Some(w) = win_i.as_ref() {
+                    b.arg(w);
+                }
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
+    /// KV chunk write at a DEVICE offset (bf16): buf[h, pos+t, d] = src[h, t, d].
+    pub fn kv_write_chunk_at(buf: &Tensor, src: &Tensor, pos: &Tensor) -> Result<()> {
+        let dev = cuda_dev(buf)?;
+        let (heads, cap, dim) = buf.dims3()?;
+        let (h2, n, d2) = src.dims3()?;
+        if h2 != heads || d2 != dim {
+            candle::bail!("kv_write_chunk_at shape mismatch");
+        }
+        let func = dev.get_or_load_func("kv_write_chunk_at_u16", &kernels::FUSED)?;
+        let total = heads * n * dim;
+        let cfg = LaunchConfig {
+            grid_dim: (((total + 255) / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bs, bo) = cuda_parts(buf)?;
+        let (ss, so) = cuda_parts(src)?;
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(bs, bo, BF16, bp, {
+            with_slice!(ss, so, BF16, sp, {
+                with_slice!(ps, po, U32, pp, {
+                    let (h_i, c_i, n_i, d_i) = (heads as i32, cap as i32, n as i32, dim as i32);
+                    let mut b = func.builder();
+                    b.arg(&bp);
+                    b.arg(&sp);
+                    b.arg(&pp);
+                    b.arg(&h_i);
+                    b.arg(&c_i);
+                    b.arg(&n_i);
+                    b.arg(&d_i);
+                    unsafe { b.launch(cfg) }.w()?;
+                });
+            });
+        });
+        Ok(())
+    }
+
     /// R-SWA ring-slot advance: `slot = prefill + ((slot - prefill + 1) % window)`
     /// on a device u32 scalar. Graph-safe (fixed address, one thread).
     pub fn incr_ring_u32(slot: &Tensor, prefill: u32, window: u32) -> Result<()> {

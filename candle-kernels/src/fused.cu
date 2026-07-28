@@ -384,7 +384,8 @@ extern "C" __global__ void moe_topk_gate_f32(
     unsigned int* __restrict__ idx,   // [k]
     float* __restrict__ w,            // [k]
     const int n,
-    const int k) {
+    const int k,
+    const int renorm) {
     __shared__ float probs[64];
     __shared__ float smax[64];
     int t = threadIdx.x;
@@ -397,6 +398,7 @@ extern "C" __global__ void moe_topk_gate_f32(
         for (int i = 0; i < n; ++i) { probs[i] = expf(logits[i] - mx); denom += probs[i]; }
         for (int i = 0; i < n; ++i) probs[i] /= denom;
         for (int i = 0; i < n; ++i) smax[i] = probs[i];
+        float wsum = 0.f;
         for (int j = 0; j < k; ++j) {
             int best = 0;
             float bv = -1.f;
@@ -405,7 +407,149 @@ extern "C" __global__ void moe_topk_gate_f32(
             }
             idx[j] = (unsigned int)best;
             w[j] = probs[best];
+            wsum += probs[best];
             smax[best] = -2.f;
         }
+        // Optional top-k renormalization (qwen SparseMoe convention); the
+        // DSv2-Lite family passes renorm=0.
+        if (renorm != 0) {
+            for (int j = 0; j < k; ++j) w[j] /= wsum;
+        }
     }
+}
+
+// ── A2: device-driven chunked-prefill primitives ────────────────────────────
+
+// pos += delta (u32 scalar), for in-graph chunk advancement.
+extern "C" __global__ void incr_add_u32(unsigned int* __restrict__ pos,
+                                        const unsigned int delta) {
+    pos[0] += delta;
+}
+
+// out[i] = pos + i for i in [0, n): per-token rope positions of a chunk.
+extern "C" __global__ void iota_add_u32(unsigned int* __restrict__ out,
+                                        const unsigned int* __restrict__ pos,
+                                        const int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = pos[0] + (unsigned int)i;
+}
+
+// Causal chunk mask over a fixed KV capacity: mask[r*cap + j] = 0 when
+// j <= pos + r else -inf, for r in [0, rows). f32.
+extern "C" __global__ void chunk_mask_from_pos_f32(
+    float* __restrict__ mask,
+    const unsigned int* __restrict__ pos,
+    const int rows,
+    const int cap) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cap) return;
+    int r = idx / cap;
+    int j = idx % cap;
+    mask[idx] = (j <= (int)(pos[0]) + r) ? 0.0f : -INFINITY;
+}
+
+// Sliding-window causal chunk mask: valid when pos+r-window < j <= pos+r.
+extern "C" __global__ void chunk_mask_window_from_pos_f32(
+    float* __restrict__ mask,
+    const unsigned int* __restrict__ pos,
+    const int rows,
+    const int cap,
+    const int window) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cap) return;
+    int r = idx / cap;
+    int j = idx % cap;
+    int p = (int)(pos[0]) + r;
+    mask[idx] = (j <= p && j > p - window) ? 0.0f : -INFINITY;
+}
+
+// KV chunk write at a DEVICE offset: buf[h, pos+t, d] = src[h, t, d]
+// (bf16 payloads as u16; layout [heads, cap, dim] vs src [heads, n, dim]).
+extern "C" __global__ void kv_write_chunk_at_u16(
+    unsigned short* __restrict__ buf,
+    const unsigned short* __restrict__ src,
+    const unsigned int* __restrict__ pos,
+    const int heads,
+    const int cap,
+    const int n,
+    const int dim) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)heads * n * dim;
+    if (idx >= total) return;
+    int d = idx % dim;
+    long hn = idx / dim;
+    int t = hn % n;
+    int h = hn / n;
+    buf[((long)h * cap + pos[0] + t) * dim + d] = src[((long)h * n + t) * dim + d];
+}
+
+// ── A5: gathered-expert GEMVs (seq=1 MoE decode, bf16 weights) ─────────────
+// Expert weights stacked [E, I, H] (gate/up) and [E, H, I] (down); the
+// selected expert ids arrive in device memory (moe_topk_gate_f32 output),
+// so the whole MoE step is graph-replayable.
+
+#include <cuda_bf16.h>
+
+// h[j, i] = silu(Wg[e_j, i, :] . x) * (Wu[e_j, i, :] . x), one warp per
+// (j, i) output element; f32 accumulation.
+extern "C" __global__ void moe_gemv_gateup_bf16(
+    const __nv_bfloat16* __restrict__ wg, // [E, I, H]
+    const __nv_bfloat16* __restrict__ wu, // [E, I, H]
+    const __nv_bfloat16* __restrict__ x,  // [H]
+    const unsigned int* __restrict__ idx, // [k]
+    __nv_bfloat16* __restrict__ h,        // [k, I]
+    const int inter,
+    const int hidden) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    int j = warp / inter;
+    int i = warp % inter;
+    long e = (long)idx[j];
+    const __nv_bfloat16* wgr = wg + (e * inter + i) * (long)hidden;
+    const __nv_bfloat16* wur = wu + (e * inter + i) * (long)hidden;
+    float accg = 0.f, accu = 0.f;
+    for (int t = lane; t < hidden; t += 32) {
+        float xv = __bfloat162float(x[t]);
+        accg += __bfloat162float(wgr[t]) * xv;
+        accu += __bfloat162float(wur[t]) * xv;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        accg += __shfl_down_sync(0xffffffff, accg, off);
+        accu += __shfl_down_sync(0xffffffff, accu, off);
+    }
+    if (lane == 0) {
+        float g = accg / (1.0f + expf(-accg)); // silu
+        h[(long)j * inter + i] = __float2bfloat16(g * accu);
+    }
+}
+
+// y[o] = sum_j w[j] * (Wd[e_j, o, :] . h[j, :]); one warp per output elem,
+// looping the k selected experts inside the warp.
+extern "C" __global__ void moe_gemv_down_bf16(
+    const __nv_bfloat16* __restrict__ wd, // [E, H, I]
+    const __nv_bfloat16* __restrict__ h,  // [k, I]
+    const unsigned int* __restrict__ idx, // [k]
+    const float* __restrict__ w,          // [k]
+    __nv_bfloat16* __restrict__ y,        // [H]
+    const int k,
+    const int inter,
+    const int hidden) {
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x & 31;
+    if (warp >= hidden) return;
+    float acc = 0.f;
+    for (int j = 0; j < k; ++j) {
+        long e = (long)idx[j];
+        const __nv_bfloat16* wr = wd + (e * (long)hidden + warp) * (long)inter;
+        const __nv_bfloat16* hr = h + (long)j * inter;
+        float a = 0.f;
+        for (int t = lane; t < inter; t += 32) {
+            a += __bfloat162float(wr[t]) * __bfloat162float(hr[t]);
+        }
+        acc += w[j] * a;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (lane == 0) y[warp] = __float2bfloat16(acc);
 }
