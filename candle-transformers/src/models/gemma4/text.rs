@@ -1083,6 +1083,39 @@ impl Attention {
             (kbuf.clone(), vbuf.clone(), q)
         };
 
+        // A6: FA2 prefill path (EXP1_FLASH_PREFILL=1, feature "flash-attn").
+        // Layout [b, seq, heads, hd]; GQA native (no repeat_kv copies);
+        // softmax scale 1.0 (q_norm absorbs it); causal aligns bottom-right
+        // when klen > qlen == exactly chunk semantics; sliding layers use
+        // the windowed-causal variant.
+        #[cfg(feature = "flash-attn")]
+        if std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false) {
+            let q_fa = q.transpose(1, 2)?.contiguous()?; // [1, C, h, hd]
+            let k_fa = kbuf
+                .narrow(1, 0, klen)?
+                .unsqueeze(0)?
+                .transpose(1, 2)?
+                .contiguous()?; // [1, klen, kvh, hd]
+            let v_fa = vbuf
+                .narrow(1, 0, klen)?
+                .unsqueeze(0)?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let out = if self.is_sliding {
+                candle_flash_attn::flash_attn_windowed(
+                    &q_fa,
+                    &k_fa,
+                    &v_fa,
+                    1.0,
+                    Some(ctx.sliding_window.saturating_sub(1)),
+                    Some(0),
+                )?
+            } else {
+                candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, true)?
+            };
+            return out.reshape((1, t_len, ()))?.apply(&self.o_proj);
+        }
+
         // Attend over the written prefix with the dynamic-path mask builder.
         let kpre = kbuf.narrow(1, 0, klen)?.unsqueeze(0)?; // [1, kvh, klen, hd]
         let vpre = vbuf.narrow(1, 0, klen)?.unsqueeze(0)?;
