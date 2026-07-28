@@ -430,6 +430,39 @@ pub mod static_decode {
     /// ([kv_heads, max_seq, hd]) at rows [pos, pos+t). Eager prefill path:
     /// `pos` is a host value (NOT graph-safe — decode keeps using kv_write
     /// with the device-resident position).
+    /// A5 device-side top-k gating: softmax(logits) -> greedy top-k
+    /// (torch lowest-index ties); renorm=true renormalizes the k probs
+    /// (qwen SparseMoe convention).
+    pub fn moe_topk_gate(logits: &Tensor, idx: &Tensor, w: &Tensor, renorm: bool) -> Result<()> {
+        let dev = cuda_dev(logits)?;
+        let n = logits.elem_count();
+        let k = idx.elem_count();
+        if n > 64 {
+            candle::bail!("moe_topk_gate_f32 supports n <= 64");
+        }
+        let func = dev.get_or_load_func("moe_topk_gate_f32", &kernels::FUSED)?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+        let (ls, lo) = cuda_parts(logits)?;
+        let (is, io) = cuda_parts(idx)?;
+        let (ws, wo) = cuda_parts(w)?;
+        with_slice!(ls, lo, F32, lp, {
+            with_slice!(is, io, U32, ip, {
+                with_slice!(ws, wo, F32, wp, {
+                    let (n_i, k_i, r_i) = (n as i32, k as i32, renorm as i32);
+                    let mut b = func.builder();
+                    b.arg(&lp);
+                    b.arg(&ip);
+                    b.arg(&wp);
+                    b.arg(&n_i);
+                    b.arg(&k_i);
+                    b.arg(&r_i);
+                    unsafe { b.launch(cfg) }.w()?;
+                });
+            });
+        });
+        Ok(())
+    }
+
     /// A5 gathered-expert gate/up GEMV: h[j,i] = silu(Wg[e_j,i]·x)·(Wu[e_j,i]·x).
     pub fn moe_gemv_gateup(
         wg: &Tensor,  // [E, I, H] bf16

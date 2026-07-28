@@ -43,7 +43,8 @@ pub struct Qwen35TextConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub num_hidden_layers: usize,
-    pub intermediate_size: usize,
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
     pub vocab_size: usize,
     #[serde(default)]
     pub head_dim: Option<usize>,
@@ -876,7 +877,10 @@ impl SparseMoe {
     fn new(cfg: &Qwen35TextConfig, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
         let e = cfg.num_experts.unwrap_or(0);
-        let inter = cfg.moe_intermediate_size.unwrap_or(cfg.intermediate_size);
+        let inter = cfg
+            .moe_intermediate_size
+            .or(cfg.intermediate_size)
+            .expect("either moe_intermediate_size or intermediate_size");
         let mut experts = Vec::with_capacity(e);
         for i in 0..e {
             experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
@@ -976,7 +980,11 @@ impl DecoderLayer {
         let ffn = if cfg.num_experts.unwrap_or(0) > 0 {
             Ffn::Moe(SparseMoe::new(cfg, vb.pp("mlp"))?)
         } else {
-            Ffn::Dense(Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?)
+            Ffn::Dense(Mlp::new(
+                cfg.hidden_size,
+                cfg.intermediate_size.expect("dense layer needs intermediate_size"),
+                vb.pp("mlp"),
+            )?)
         };
         Ok(Self {
             mixer,
