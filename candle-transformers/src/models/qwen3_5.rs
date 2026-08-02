@@ -844,7 +844,44 @@ struct Mlp {
     down_proj: Proj,
 }
 
+fn qproj_tensor(w: Tensor, key: String) -> Result<Proj> {
+    let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
+    match quant {
+        None => Ok(Proj::Plain(Linear::new(w, None))),
+        Some(dtype) => {
+            let in_dim = w.dim(1)?;
+            let dtype = quant_dtype_for(in_dim, dtype);
+            let dev = w.device().clone();
+            let q = if let Some(q) = qcache::get(&key, &dev) {
+                Arc::new(q)
+            } else {
+                let q = if dev.is_cuda() {
+                    let cpu = w.to_device(&Device::Cpu)?;
+                    QTensor::quantize_onto(&cpu, dtype, &dev)?
+                } else {
+                    QTensor::quantize(&w.to_dtype(DType::F32)?, dtype)?
+                };
+                let q = Arc::new(q);
+                qcache::put(&key, &q);
+                q
+            };
+            Ok(Proj::Quant(QMatMul::QTensor(q)))
+        }
+    }
+}
+
 impl Mlp {
+    /// Build from raw [out, in] weight slices (packed-expert checkpoints),
+    /// routing each through the quantization/qcache path under classic
+    /// per-expert key names so qcache files stay layout-agnostic.
+    fn from_weights(gate_w: Tensor, up_w: Tensor, down_w: Tensor, key_prefix: &str) -> Result<Self> {
+        Ok(Self {
+            gate_proj: qproj_tensor(gate_w, format!("{key_prefix}.gate_proj"))?,
+            up_proj: qproj_tensor(up_w, format!("{key_prefix}.up_proj"))?,
+            down_proj: qproj_tensor(down_w, format!("{key_prefix}.down_proj"))?,
+        })
+    }
+
     fn new(h: usize, inter: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             gate_proj: qproj(h, inter, vb.pp("gate_proj"))?,
@@ -882,8 +919,27 @@ impl SparseMoe {
             .or(cfg.intermediate_size)
             .expect("either moe_intermediate_size or intermediate_size");
         let mut experts = Vec::with_capacity(e);
-        for i in 0..e {
-            experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
+        // Modern checkpoints (Qwen3.6-A3B) pack experts into two stacked
+        // tensors: gate_up_proj [E, 2I, H] (gate rows first) and down_proj
+        // [E, H, I] — each expert slice is already [out, in] Linear layout.
+        let evb = vb.pp("experts");
+        if evb.contains_tensor("gate_up_proj") {
+            let gu = evb.get((e, 2 * inter, h), "gate_up_proj")?;
+            let dn = evb.get((e, h, inter), "down_proj")?;
+            let kp = evb.prefix();
+            for i in 0..e {
+                let gui = gu.i(i)?;
+                experts.push(Mlp::from_weights(
+                    gui.narrow(0, 0, inter)?.contiguous()?,
+                    gui.narrow(0, inter, inter)?.contiguous()?,
+                    dn.i(i)?.contiguous()?,
+                    &format!("{kp}.{i}"),
+                )?);
+            }
+        } else {
+            for i in 0..e {
+                experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
+            }
         }
         let (shared_expert, shared_expert_gate) =
             match cfg.shared_expert_intermediate_size {
