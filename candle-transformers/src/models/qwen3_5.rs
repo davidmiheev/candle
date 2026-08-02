@@ -844,6 +844,29 @@ struct Mlp {
     down_proj: Proj,
 }
 
+fn qproj_cpu(w: &Tensor, dev: &Device, key: String) -> Result<Proj> {
+    let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
+    match quant {
+        None => Ok(Proj::Plain(Linear::new(w.to_device(dev)?, None))),
+        Some(dtype) => {
+            let dtype = quant_dtype_for(w.dim(1)?, dtype);
+            let q = if let Some(q) = qcache::get(&key, dev) {
+                Arc::new(q)
+            } else {
+                let q = if dev.is_cuda() {
+                    QTensor::quantize_onto(w, dtype, dev)?
+                } else {
+                    QTensor::quantize(&w.to_dtype(DType::F32)?, dtype)?
+                };
+                let q = Arc::new(q);
+                qcache::put(&key, &q);
+                q
+            };
+            Ok(Proj::Quant(QMatMul::QTensor(q)))
+        }
+    }
+}
+
 fn qproj_tensor(w: Tensor, key: String) -> Result<Proj> {
     let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
     match quant {
@@ -871,14 +894,20 @@ fn qproj_tensor(w: Tensor, key: String) -> Result<Proj> {
 }
 
 impl Mlp {
-    /// Build from raw [out, in] weight slices (packed-expert checkpoints),
-    /// routing each through the quantization/qcache path under classic
-    /// per-expert key names so qcache files stay layout-agnostic.
-    fn from_weights(gate_w: Tensor, up_w: Tensor, down_w: Tensor, key_prefix: &str) -> Result<Self> {
+    /// Build from CPU-resident [out, in] slices (packed-expert checkpoints):
+    /// quantize on the calling thread (CPU-bound, parallel-safe), upload the
+    /// QTensor to `dev`, register in qcache under classic per-expert names.
+    fn from_cpu_weights(
+        gate_w: &Tensor,
+        up_w: &Tensor,
+        down_w: &Tensor,
+        dev: &Device,
+        key_prefix: &str,
+    ) -> Result<Self> {
         Ok(Self {
-            gate_proj: qproj_tensor(gate_w, format!("{key_prefix}.gate_proj"))?,
-            up_proj: qproj_tensor(up_w, format!("{key_prefix}.up_proj"))?,
-            down_proj: qproj_tensor(down_w, format!("{key_prefix}.down_proj"))?,
+            gate_proj: qproj_cpu(gate_w, dev, format!("{key_prefix}.gate_proj"))?,
+            up_proj: qproj_cpu(up_w, dev, format!("{key_prefix}.up_proj"))?,
+            down_proj: qproj_cpu(down_w, dev, format!("{key_prefix}.down_proj"))?,
         })
     }
 
@@ -927,14 +956,53 @@ impl SparseMoe {
             let gu = evb.get((e, 2 * inter, h), "gate_up_proj")?;
             let dn = evb.get((e, h, inter), "down_proj")?;
             let kp = evb.prefix();
+            // Quantization of 3 x E slices is CPU-bound; fan it out across
+            // threads (16 vCPU pod: ~10x). Slices move to CPU first so the
+            // workers never touch the CUDA context concurrently.
+            let mut slices = Vec::with_capacity(e);
+            let cpu = Device::Cpu;
             for i in 0..e {
                 let gui = gu.i(i)?;
-                experts.push(Mlp::from_weights(
-                    gui.narrow(0, 0, inter)?.contiguous()?,
-                    gui.narrow(0, inter, inter)?.contiguous()?,
-                    dn.i(i)?.contiguous()?,
-                    &format!("{kp}.{i}"),
-                )?);
+                slices.push((
+                    gui.narrow(0, 0, inter)?.contiguous()?.to_device(&cpu)?,
+                    gui.narrow(0, inter, inter)?.contiguous()?.to_device(&cpu)?,
+                    dn.i(i)?.contiguous()?.to_device(&cpu)?,
+                ));
+            }
+            let dev_main = vb.device().clone();
+            let n_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(e.max(1));
+            let results: Vec<Result<Mlp>> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                let slices_ref = &slices;
+                let dev_ref = &dev_main;
+                let kp_ref: &str = &kp;
+                for w in 0..n_workers {
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::new();
+                        let mut i = w;
+                        while i < slices_ref.len() {
+                            let (g, u, d) = &slices_ref[i];
+                            out.push((
+                                i,
+                                Mlp::from_cpu_weights(g, u, d, dev_ref, &format!("{kp_ref}.{i}")),
+                            ));
+                            i += n_workers;
+                        }
+                        out
+                    }));
+                }
+                let mut all: Vec<(usize, Result<Mlp>)> = Vec::with_capacity(e);
+                for h in handles {
+                    all.extend(h.join().expect("expert quant worker panicked"));
+                }
+                all.sort_by_key(|(i, _)| *i);
+                all.into_iter().map(|(_, r)| r).collect()
+            });
+            for r in results {
+                experts.push(r?);
             }
         } else {
             for i in 0..e {

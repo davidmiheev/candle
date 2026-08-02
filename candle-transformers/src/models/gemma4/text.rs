@@ -2293,6 +2293,14 @@ impl TextModel {
         Ok(logits)
     }
 
+    /// Debug: read the device-resident static position counter.
+    pub fn debug_read_static_pos(&self) -> Result<u32> {
+        match self.static_ctx.as_ref() {
+            Some(ctx) => Ok(ctx.pos.to_vec1::<u32>()?[0]),
+            None => Ok(u32::MAX),
+        }
+    }
+
     /// Rewind the static context to position 0 (host-side; call between
     /// requests, never inside a captured graph).
     pub fn reset_static(&mut self) -> Result<()> {
