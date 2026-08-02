@@ -433,12 +433,95 @@ pub mod static_decode {
     /// A5 device-side top-k gating: softmax(logits) -> greedy top-k
     /// (torch lowest-index ties); renorm=true renormalizes the k probs
     /// (qwen SparseMoe convention).
+
+    /// A5b: stage the quantized rows of the top-k experts (device-resident
+    /// idx) into a fixed buffer, so quantized GEMV kernels see capture-stable
+    /// pointers. Pure byte movement over raw qtensor storage.
+    pub fn moe_gather_qrows(
+        src: &candle::CudaStorage,
+        idx: &Tensor,
+        dst: &candle::CudaStorage,
+        rows_per_expert: usize,
+        row_bytes: usize,
+        k: usize,
+    ) -> Result<()> {
+        let dev = src.device().clone();
+        let func = dev.get_or_load_func("moe_gather_qrows", &kernels::FUSED)?;
+        let total = (k * rows_per_expert * row_bytes) as u32;
+        let threads = 256u32;
+        let blocks = (total / 16 / threads + 1).min(1024);
+        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let (is, io) = cuda_parts(idx)?;
+        let sp = src.as_cuda_slice::<u8>()?;
+        let dp = dst.as_cuda_slice::<u8>()?;
+        with_slice!(is, io, U32, ip, {
+            let (r_i, b_i, k_i) = (rows_per_expert as i32, row_bytes as i32, k as i32);
+            let mut b = func.builder();
+            b.arg(&sp);
+            b.arg(&ip);
+            b.arg(&dp);
+            b.arg(&r_i);
+            b.arg(&b_i);
+            b.arg(&k_i);
+            unsafe { b.launch(cfg) }.w()?;
+        });
+        Ok(())
+    }
+
+    /// A5b: h[j,i] = silu(gu[j,i]) * gu[j,I+i] over the staged gate/up GEMV
+    /// output rows.
+    pub fn moe_silu_mul(gu: &Tensor, h: &Tensor, inter: usize, k: usize) -> Result<()> {
+        let dev = cuda_dev(gu)?;
+        let func = dev.get_or_load_func("moe_silu_mul_f32", &kernels::FUSED)?;
+        let n = (k * inter) as u32;
+        let cfg = LaunchConfig { grid_dim: ((n / 256 + 1).min(1024), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let (gs, go) = cuda_parts(gu)?;
+        let (hs, ho) = cuda_parts(h)?;
+        with_slice!(gs, go, F32, gp, {
+            with_slice!(hs, ho, F32, hp, {
+                let (i_i, k_i) = (inter as i32, k as i32);
+                let mut b = func.builder();
+                b.arg(&gp);
+                b.arg(&hp);
+                b.arg(&i_i);
+                b.arg(&k_i);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
+    /// A5b: y[o] = sum_j w[j] * part[j, o] with device-resident weights.
+    pub fn moe_weighted_sum(part: &Tensor, w: &Tensor, y: &Tensor, hidden: usize, k: usize) -> Result<()> {
+        let dev = cuda_dev(part)?;
+        let func = dev.get_or_load_func("moe_weighted_sum_f32", &kernels::FUSED)?;
+        let cfg = LaunchConfig { grid_dim: ((hidden as u32 / 256 + 1).min(1024), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let (ps, po) = cuda_parts(part)?;
+        let (ws, wo) = cuda_parts(w)?;
+        let (ys, yo) = cuda_parts(y)?;
+        with_slice!(ps, po, F32, pp, {
+            with_slice!(ws, wo, F32, wp, {
+                with_slice!(ys, yo, F32, yp, {
+                    let (h_i, k_i) = (hidden as i32, k as i32);
+                    let mut b = func.builder();
+                    b.arg(&pp);
+                    b.arg(&wp);
+                    b.arg(&yp);
+                    b.arg(&h_i);
+                    b.arg(&k_i);
+                    unsafe { b.launch(cfg) }.w()?;
+                });
+            });
+        });
+        Ok(())
+    }
+
     pub fn moe_topk_gate(logits: &Tensor, idx: &Tensor, w: &Tensor, renorm: bool) -> Result<()> {
         let dev = cuda_dev(logits)?;
         let n = logits.elem_count();
         let k = idx.elem_count();
-        if n > 64 {
-            candle::bail!("moe_topk_gate_f32 supports n <= 64");
+        if n > 256 {
+            candle::bail!("moe_topk_gate_f32 supports n <= 256");
         }
         let func = dev.get_or_load_func("moe_topk_gate_f32", &kernels::FUSED)?;
         let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };

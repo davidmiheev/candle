@@ -386,8 +386,8 @@ extern "C" __global__ void moe_topk_gate_f32(
     const int n,
     const int k,
     const int renorm) {
-    __shared__ float probs[64];
-    __shared__ float smax[64];
+    __shared__ float probs[256];
+    __shared__ float smax[256];
     int t = threadIdx.x;
     // softmax (n <= 64: single-block reduction, serial by thread 0 is fine
     // at this size and keeps the tie semantics trivially exact)
@@ -552,4 +552,72 @@ extern "C" __global__ void moe_gemv_down_bf16(
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (lane == 0) y[warp] = __float2bfloat16(acc);
+}
+
+// ── A5b: capture-safe MoE expert staging (indirect q-row gather) ─────────────
+// Copies the quantized rows of the top-k experts (device-resident `idx`)
+// from the packed per-layer buffer into a fixed staging buffer, so the
+// existing dequantize_mul_mat_vec kernels run on capture-stable pointers.
+// Pure byte movement: dtype-agnostic.
+extern "C" __global__ void moe_gather_qrows(
+    const unsigned char* __restrict__ src, // [E * rows_per_expert * row_bytes]
+    const unsigned int* __restrict__ idx,  // [k]
+    unsigned char* __restrict__ dst,       // [k * rows_per_expert * row_bytes]
+    const int rows_per_expert,
+    const int row_bytes,
+    const int k
+) {
+    const long expert_bytes = (long)rows_per_expert * row_bytes;
+    const long total = (long)k * expert_bytes;
+    const long stride = (long)blockDim.x * gridDim.x * 16;
+    for (long o = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 16; o < total; o += stride) {
+        const int j = (int)(o / expert_bytes);
+        const long within = o - (long)j * expert_bytes;
+        const long s = (long)idx[j] * expert_bytes + within;
+        // 16B vector copies; buffers are block-aligned (q4k block 144B is not
+        // 16-aligned per-row, but the EXPERT payload start is arbitrary —
+        // fall back to byte copy for the (rare) tail/misaligned case.
+        if ((within & 15) == 0 && ((long)(src + s) & 15) == 0 && ((long)(dst + o) & 15) == 0 && within + 16 <= expert_bytes) {
+            *(uint4*)(dst + o) = *(const uint4*)(src + s);
+        } else {
+            for (int b = 0; b < 16 && within + b < expert_bytes; b++) {
+                dst[o + b] = src[s + b];
+            }
+        }
+    }
+}
+
+// h[j, i] = silu(g[j, i]) * u[j, i], gate/up interleaved as [k, 2I] rows from
+// the staged gate_up GEMV output (gate rows first within each expert's 2I).
+extern "C" __global__ void moe_silu_mul_f32(
+    const float* __restrict__ gu, // [k * 2I] (per expert: I gate then I up)
+    float* __restrict__ h,        // [k * I]
+    const int inter,
+    const int k
+) {
+    const int n = k * inter;
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += blockDim.x * gridDim.x) {
+        const int j = t / inter;
+        const int i = t - j * inter;
+        const float g = gu[(long)j * 2 * inter + i];
+        const float u = gu[(long)j * 2 * inter + inter + i];
+        h[t] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+// y[o] = sum_j w[j] * part[j, o]   (device-resident routing weights)
+extern "C" __global__ void moe_weighted_sum_f32(
+    const float* __restrict__ part, // [k, H]
+    const float* __restrict__ w,    // [k]
+    float* __restrict__ y,          // [H]
+    const int hidden,
+    const int k
+) {
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < hidden; o += blockDim.x * gridDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j < k; j++) {
+            acc += w[j] * part[(long)j * hidden + o];
+        }
+        y[o] = acc;
+    }
 }
