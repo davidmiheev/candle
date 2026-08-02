@@ -956,6 +956,24 @@ impl SparseMoe {
             let gu = evb.get((e, 2 * inter, h), "gate_up_proj")?;
             let dn = evb.get((e, h, inter), "down_proj")?;
             let kp = evb.prefix();
+            let parallel = std::env::var("EXP1_PAR_EXPERT_QUANT")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if !parallel {
+                // Sequential (default): slow but proven. The parallel path
+                // below crashes silently mid-load (suspected cudarc stream
+                // races from concurrent quantize_onto uploads) — opt-in via
+                // EXP1_PAR_EXPERT_QUANT=1 until root-caused.
+                for i in 0..e {
+                    let gui = gu.i(i)?;
+                    experts.push(Mlp::from_weights(
+                        gui.narrow(0, 0, inter)?.contiguous()?,
+                        gui.narrow(0, inter, inter)?.contiguous()?,
+                        dn.i(i)?.contiguous()?,
+                        &format!("{kp}.{i}"),
+                    )?);
+                }
+            } else {
             // Quantization of 3 x E slices is CPU-bound; fan it out across
             // threads (16 vCPU pod: ~10x). Slices move to CPU first so the
             // workers never touch the CUDA context concurrently.
@@ -1006,6 +1024,7 @@ impl SparseMoe {
             });
             for r in results {
                 experts.push(r?);
+            }
             }
         } else {
             for i in 0..e {
