@@ -894,6 +894,17 @@ fn qproj_tensor(w: Tensor, key: String) -> Result<Proj> {
 }
 
 impl Mlp {
+    /// Build from raw [out, in] weight slices (packed-expert checkpoints),
+    /// routing each through the quantization/qcache path under classic
+    /// per-expert key names so qcache files stay layout-agnostic.
+    fn from_weights(gate_w: Tensor, up_w: Tensor, down_w: Tensor, key_prefix: &str) -> Result<Self> {
+        Ok(Self {
+            gate_proj: qproj_tensor(gate_w, format!("{key_prefix}.gate_proj"))?,
+            up_proj: qproj_tensor(up_w, format!("{key_prefix}.up_proj"))?,
+            down_proj: qproj_tensor(down_w, format!("{key_prefix}.down_proj"))?,
+        })
+    }
+
     /// Build from CPU-resident [out, in] slices (packed-expert checkpoints):
     /// quantize on the calling thread (CPU-bound, parallel-safe), upload the
     /// QTensor to `dev`, register in qcache under classic per-expert names.
