@@ -1276,6 +1276,15 @@ impl SparseMoe {
     /// fixed pointers, zero host readouts -> legal inside graph capture.
     fn forward_device_one(&self, dm: &DeviceMoe, xt: &Tensor) -> Result<Tensor> {
         use candle_nn::fused::static_decode as sd;
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("A5B_TRACE").is_ok() && c % 100 == 0 {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            eprintln!("[a5b] call #{c} t={t}");
+        }
         // Router logits -> f32 buffer (copy_into keeps the pointer stable).
         let logits = self.gate.forward(xt)?.to_dtype(DType::F32)?.flatten_all()?;
         sd::copy_into(&dm.logits32, &logits)?;

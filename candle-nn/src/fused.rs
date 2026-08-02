@@ -447,7 +447,7 @@ pub mod static_decode {
         nrows: usize,
     ) -> Result<()> {
         let dev = buf.device().clone();
-        let func = dev.get_or_load_func("dequantize_mul_mat_vec_q4_k", &candle_kernels::QUANTIZED)?;
+        let func = dev.get_or_load_func("dequantize_mul_mat_vec_q4_k", &kernels::QUANTIZED)?;
         // Launch geometry per candle's dmmv path: block (32, 4), rows/4 blocks.
         let block_y = 4u32;
         let grid = ((nrows as u32).div_ceil(block_y), 1, 1);
@@ -494,9 +494,9 @@ pub mod static_decode {
         with_slice!(is, io, U32, ip, {
             let (r_i, b_i, k_i) = (rows_per_expert as i32, row_bytes as i32, k as i32);
             let mut b = func.builder();
-            b.arg(&sp);
+            b.arg(sp);
             b.arg(&ip);
-            b.arg(&dp);
+            b.arg(dp);
             b.arg(&r_i);
             b.arg(&b_i);
             b.arg(&k_i);
