@@ -1790,7 +1790,28 @@ fn prepare_decoder_attention_mask(
     };
     let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), device)?;
     let mask = if seqlen_offset > 0 {
-        let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, device)?;
+        // History block. For sliding-window layers the history must be
+        // windowed too: row i sits at absolute position seqlen_offset+i and
+        // may only see keys within the window. All-zeros history here fed
+        // out-of-window context into sliding layers on every chunk after the
+        // first (chunked static prefill) — single-chunk was correct, multi-
+        // chunk garbled (observed as instant-eos on 1.6k prompts).
+        let mask0 = if let Some(w) = sliding_window {
+            let h: Vec<f32> = (0..tgt_len)
+                .flat_map(|i| {
+                    (0..seqlen_offset).map(move |j| {
+                        if j + w < seqlen_offset + i {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.
+                        }
+                    })
+                })
+                .collect();
+            Tensor::from_slice(&h, (tgt_len, seqlen_offset), device)?
+        } else {
+            Tensor::zeros((tgt_len, seqlen_offset), DType::F32, device)?
+        };
         Tensor::cat(&[&mask0, &mask], D::Minus1)?
     } else {
         mask
