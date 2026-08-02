@@ -434,6 +434,43 @@ pub mod static_decode {
     /// (torch lowest-index ties); renorm=true renormalizes the k probs
     /// (qwen SparseMoe convention).
 
+    /// A5b: direct q4_K GEMV over a raw staged byte buffer:
+    /// dst[row] = q4k_rows(buf)[row] . y   for row in 0..nrows.
+    /// Mirrors candle's quantized cuda path but takes raw storage so it can
+    /// run on gathered (capture-staged) expert rows.
+    pub fn qgemv_q4k_raw(
+        buf: &candle::CudaStorage,
+        buf_byte_offset: usize,
+        y_f32: &Tensor,
+        dst_f32: &Tensor,
+        ncols: usize,
+        nrows: usize,
+    ) -> Result<()> {
+        let dev = buf.device().clone();
+        let func = dev.get_or_load_func("dequantize_mul_mat_vec_q4_k", &candle_kernels::QUANTIZED)?;
+        // Launch geometry per candle's dmmv path: block (32, 4), rows/4 blocks.
+        let block_y = 4u32;
+        let grid = ((nrows as u32).div_ceil(block_y), 1, 1);
+        let cfg = LaunchConfig { grid_dim: grid, block_dim: (32, block_y, 1), shared_mem_bytes: 0 };
+        let bp = buf.as_cuda_slice::<u8>()?;
+        let bp = bp.slice(buf_byte_offset..);
+        let (ys, yo) = cuda_parts(y_f32)?;
+        let (ds, do_) = cuda_parts(dst_f32)?;
+        with_slice!(ys, yo, F32, yp, {
+            with_slice!(ds, do_, F32, dp, {
+                let (nc, nr) = (ncols as i32, nrows as i32);
+                let mut b = func.builder();
+                b.arg(&bp);
+                b.arg(&yp);
+                b.arg(&dp);
+                b.arg(&nc);
+                b.arg(&nr);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
     /// A5b: stage the quantized rows of the top-k experts (device-resident
     /// idx) into a fixed buffer, so quantized GEMV kernels see capture-stable
     /// pointers. Pure byte movement over raw qtensor storage.
