@@ -980,7 +980,10 @@ impl SparseMoe {
                 let dev_ref = &dev_main;
                 let kp_ref: &str = &kp;
                 for w in 0..n_workers {
-                    handles.push(scope.spawn(move || {
+                    let b = std::thread::Builder::new()
+                        .name(format!("expert-quant-{w}"))
+                        .stack_size(32 * 1024 * 1024);
+                    handles.push(b.spawn_scoped(scope, move || {
                         let mut out = Vec::new();
                         let mut i = w;
                         while i < slices_ref.len() {
@@ -992,7 +995,7 @@ impl SparseMoe {
                             i += n_workers;
                         }
                         out
-                    }));
+                    }).expect("spawn expert-quant worker"));
                 }
                 let mut all: Vec<(usize, Result<Mlp>)> = Vec::with_capacity(e);
                 for h in handles {
