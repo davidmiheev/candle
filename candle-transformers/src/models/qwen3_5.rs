@@ -844,6 +844,14 @@ struct Mlp {
     down_proj: Proj,
 }
 
+fn anyhow_ok(cond: bool, msg: &str) -> Result<()> {
+    if cond {
+        Ok(())
+    } else {
+        candle::bail!("{}", msg)
+    }
+}
+
 fn qproj_cpu(w: &Tensor, dev: &Device, key: String) -> Result<Proj> {
     let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
     match quant {
@@ -971,18 +979,83 @@ impl SparseMoe {
                 .map(|v| v == "1")
                 .unwrap_or(false);
             if !parallel {
-                // Sequential (default): slow but proven. The parallel path
-                // below crashes silently mid-load (suspected cudarc stream
-                // races from concurrent quantize_onto uploads) — opt-in via
-                // EXP1_PAR_EXPERT_QUANT=1 until root-caused.
-                for i in 0..e {
-                    let gui = gu.i(i)?;
-                    experts.push(Mlp::from_weights(
-                        gui.narrow(0, 0, inter)?.contiguous()?,
-                        gui.narrow(0, inter, inter)?.contiguous()?,
-                        dn.i(i)?.contiguous()?,
-                        &format!("{kp}.{i}"),
-                    )?);
+                // Batched (default): quantize each packed tensor in ONE call,
+                // then split the quantized bytes at expert-row boundaries.
+                // Rows are whole quantization blocks (H, I % block == 0), so
+                // byte-slicing is exact and the per-expert records are
+                // identical to slice-wise quantization. 2 quantize calls per
+                // layer instead of 3*E; ~18x fewer per-tensor fixed costs.
+                let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
+                match quant {
+                    None => {
+                        for i in 0..e {
+                            let gui = gu.i(i)?;
+                            experts.push(Mlp::from_weights(
+                                gui.narrow(0, 0, inter)?.contiguous()?,
+                                gui.narrow(0, inter, inter)?.contiguous()?,
+                                dn.i(i)?.contiguous()?,
+                                &format!("{kp}.{i}"),
+                            )?);
+                        }
+                    }
+                    Some(dtype) => {
+                        use candle::quantized::ggml_file::qtensor_from_ggml;
+                        let dev = vb.device().clone();
+                        let cpu = Device::Cpu;
+                        let d_gu = quant_dtype_for(h, dtype);
+                        let d_dn = quant_dtype_for(inter, dtype);
+                        anyhow_ok(h % d_gu.block_size() == 0, "gate/up rows not block-aligned")?;
+                        anyhow_ok(inter % d_dn.block_size() == 0, "down rows not block-aligned")?;
+                        // gate_up: [E, 2I, H] -> flat rows, one quantize.
+                        let gu_flat = gu
+                            .to_device(&cpu)?
+                            .to_dtype(DType::F32)?
+                            .reshape((e * 2 * inter, h))?;
+                        let q_gu = QTensor::quantize(&gu_flat, d_gu)?;
+                        let gu_bytes = q_gu.data()?;
+                        let row_gu = h / d_gu.block_size() * d_gu.type_size();
+                        // down: [E, H, I] -> flat rows, one quantize.
+                        let dn_flat = dn
+                            .to_device(&cpu)?
+                            .to_dtype(DType::F32)?
+                            .reshape((e * h, inter))?;
+                        let q_dn = QTensor::quantize(&dn_flat, d_dn)?;
+                        let dn_bytes = q_dn.data()?;
+                        let row_dn = inter / d_dn.block_size() * d_dn.type_size();
+                        for i in 0..e {
+                            let g0 = i * 2 * inter * row_gu;
+                            let gate = qtensor_from_ggml(
+                                d_gu,
+                                &gu_bytes[g0..g0 + inter * row_gu],
+                                vec![inter, h],
+                                &dev,
+                            )?;
+                            let u0 = g0 + inter * row_gu;
+                            let up = qtensor_from_ggml(
+                                d_gu,
+                                &gu_bytes[u0..u0 + inter * row_gu],
+                                vec![inter, h],
+                                &dev,
+                            )?;
+                            let dn0 = i * h * row_dn;
+                            let down = qtensor_from_ggml(
+                                d_dn,
+                                &dn_bytes[dn0..dn0 + h * row_dn],
+                                vec![h, inter],
+                                &dev,
+                            )?;
+                            let (gate, up, down) = (Arc::new(gate), Arc::new(up), Arc::new(down));
+                            let kpref = format!("{kp}.{i}");
+                            qcache::put(&format!("{kpref}.gate_proj"), &gate);
+                            qcache::put(&format!("{kpref}.up_proj"), &up);
+                            qcache::put(&format!("{kpref}.down_proj"), &down);
+                            experts.push(Mlp {
+                                gate_proj: Proj::Quant(QMatMul::QTensor(gate)),
+                                up_proj: Proj::Quant(QMatMul::QTensor(up)),
+                                down_proj: Proj::Quant(QMatMul::QTensor(down)),
+                            });
+                        }
+                    }
                 }
             } else {
             // Quantization of 3 x E slices is CPU-bound; fan it out across
