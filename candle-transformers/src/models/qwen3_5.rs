@@ -949,13 +949,72 @@ impl Mlp {
 /// softmax router over `num_experts`, top-k renormalized, plus an
 /// always-on shared expert). Naive per-expert loop — port to the fused
 /// indexed-MoE kernel once validated.
+/// A5b device-resident MoE state: packed quantized expert weights as raw
+/// byte tensors + fixed staging/intermediate buffers. Everything the decode
+/// step touches is pre-allocated with stable pointers -> CUDA-graph safe.
+#[derive(Debug, Clone)]
+struct DeviceMoe {
+    gu_bytes: Tensor,   // u8 [E * 2I * row_gu] packed q4k gate_up rows
+    dn_bytes: Tensor,   // u8 [E * H * row_dn] packed q4k down rows
+    stage_gu: Tensor,   // u8 [k * 2I * row_gu]
+    stage_dn: Tensor,   // u8 [k * H * row_dn]
+    logits32: Tensor,   // f32 [E]
+    idx: Tensor,        // u32 [k]
+    w: Tensor,          // f32 [k]
+    x32: Tensor,        // f32 [H]
+    gu_out: Tensor,     // f32 [k * 2I]
+    hbuf: Tensor,       // f32 [k * I]
+    part: Tensor,       // f32 [k, H]
+    ybuf: Tensor,       // f32 [H]
+    row_gu: usize,
+    row_dn: usize,
+    e: usize,
+    inter: usize,
+    h: usize,
+}
+
 #[derive(Debug, Clone)]
 struct SparseMoe {
     gate: Linear, // router [num_experts, hidden]
     experts: Vec<Mlp>,
+    device_moe: Option<DeviceMoe>,
     shared_expert: Option<Mlp>,
     shared_expert_gate: Option<Linear>,
     top_k: usize,
+}
+
+fn build_device_moe(
+    gu_bytes: &[u8],
+    dn_bytes: &[u8],
+    e: usize,
+    inter: usize,
+    h: usize,
+    row_gu: usize,
+    row_dn: usize,
+    k: usize,
+    dev: &Device,
+) -> Result<DeviceMoe> {
+    let gu = Tensor::from_slice(gu_bytes, gu_bytes.len(), dev)?;
+    let dn = Tensor::from_slice(dn_bytes, dn_bytes.len(), dev)?;
+    Ok(DeviceMoe {
+        gu_bytes: gu,
+        dn_bytes: dn,
+        stage_gu: Tensor::zeros(k * 2 * inter * row_gu, DType::U8, dev)?,
+        stage_dn: Tensor::zeros(k * h * row_dn, DType::U8, dev)?,
+        logits32: Tensor::zeros(e, DType::F32, dev)?,
+        idx: Tensor::zeros(k, DType::U32, dev)?,
+        w: Tensor::zeros(k, DType::F32, dev)?,
+        x32: Tensor::zeros(h, DType::F32, dev)?,
+        gu_out: Tensor::zeros(k * 2 * inter, DType::F32, dev)?,
+        hbuf: Tensor::zeros(k * inter, DType::F32, dev)?,
+        part: Tensor::zeros((k, h), DType::F32, dev)?,
+        ybuf: Tensor::zeros(h, DType::F32, dev)?,
+        row_gu,
+        row_dn,
+        e,
+        inter,
+        h,
+    })
 }
 
 impl SparseMoe {
@@ -967,6 +1026,7 @@ impl SparseMoe {
             .or(cfg.intermediate_size)
             .expect("either moe_intermediate_size or intermediate_size");
         let mut experts = Vec::with_capacity(e);
+        let mut device_moe: Option<DeviceMoe> = None;
         // Modern checkpoints (Qwen3.6-A3B) pack experts into two stacked
         // tensors: gate_up_proj [E, 2I, H] (gate rows first) and down_proj
         // [E, H, I] — each expert slice is already [out, in] Linear layout.
@@ -1001,6 +1061,10 @@ impl SparseMoe {
                     Some(dtype) => {
                         use candle::quantized::ggml_file::qtensor_from_ggml;
                         let dev = vb.device().clone();
+                        let device_mode = std::env::var("QWEN35_MOE_DEVICE")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
+                            && dev.is_cuda();
                         let cpu = Device::Cpu;
                         let d_gu = quant_dtype_for(h, dtype);
                         let d_dn = quant_dtype_for(inter, dtype);
@@ -1022,6 +1086,29 @@ impl SparseMoe {
                         let q_dn = QTensor::quantize(&dn_flat, d_dn)?;
                         let dn_bytes = q_dn.data()?;
                         let row_dn = inter / d_dn.block_size() * d_dn.type_size();
+                        if device_mode {
+                            // Packed device path: upload the full quantized
+                            // buffers as raw u8 tensors; per-expert slicing
+                            // happens on-device at decode (gather kernel).
+                            device_moe = Some(build_device_moe(
+                                &gu_bytes, &dn_bytes, e, inter, h, row_gu, row_dn,
+                                cfg.num_experts_per_tok.unwrap_or(8), &dev,
+                            )?);
+                            // qcache still gets classic per-expert records so
+                            // the file stays layout/mode-agnostic.
+                            for i in 0..e {
+                                let g0 = i * 2 * inter * row_gu;
+                                let gate_q = qtensor_from_ggml(d_gu, &gu_bytes[g0..g0 + inter * row_gu], vec![inter, h], &Device::Cpu)?;
+                                let u0 = g0 + inter * row_gu;
+                                let up_q = qtensor_from_ggml(d_gu, &gu_bytes[u0..u0 + inter * row_gu], vec![inter, h], &Device::Cpu)?;
+                                let dn0 = i * h * row_dn;
+                                let down_q = qtensor_from_ggml(d_dn, &dn_bytes[dn0..dn0 + h * row_dn], vec![h, inter], &Device::Cpu)?;
+                                let kpref = format!("{kp}.{i}");
+                                qcache::put(&format!("{kpref}.gate_proj"), &Arc::new(gate_q));
+                                qcache::put(&format!("{kpref}.up_proj"), &Arc::new(up_q));
+                                qcache::put(&format!("{kpref}.down_proj"), &Arc::new(down_q));
+                            }
+                        } else {
                         for i in 0..e {
                             let g0 = i * 2 * inter * row_gu;
                             let gate = qtensor_from_ggml(
@@ -1054,6 +1141,7 @@ impl SparseMoe {
                                 up_proj: Proj::Quant(QMatMul::QTensor(up)),
                                 down_proj: Proj::Quant(QMatMul::QTensor(down)),
                             });
+                        }
                         }
                     }
                 }
@@ -1111,8 +1199,59 @@ impl SparseMoe {
             }
             }
         } else {
-            for i in 0..e {
-                experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
+            // Classic per-expert names (or qcache-hit loads where the raw
+            // packed tensors are absent).
+            let device_mode = std::env::var("QWEN35_MOE_DEVICE")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+                && vb.device().is_cuda();
+            let quant = *quant_setting().lock().unwrap_or_else(|p| p.into_inner());
+            let kp = evb.prefix();
+            let mut assembled = false;
+            if device_mode && quant.is_some() {
+                // Assemble packed byte buffers from the per-expert qcache
+                // records (qcache-warm path: no raws on disk).
+                let dev = vb.device().clone();
+                let cpu = Device::Cpu;
+                let mut gu_all: Vec<u8> = Vec::new();
+                let mut dn_all: Vec<u8> = Vec::new();
+                let mut row_gu = 0usize;
+                let mut row_dn = 0usize;
+                let mut ok = true;
+                for i in 0..e {
+                    let names = [
+                        format!("{kp}.{i}.gate_proj"),
+                        format!("{kp}.{i}.up_proj"),
+                        format!("{kp}.{i}.down_proj"),
+                    ];
+                    let (Some(g), Some(u), Some(d)) = (
+                        qcache::get(&names[0], &cpu),
+                        qcache::get(&names[1], &cpu),
+                        qcache::get(&names[2], &cpu),
+                    ) else {
+                        ok = false;
+                        break;
+                    };
+                    if i == 0 {
+                        row_gu = g.data()?.len() / inter;
+                        row_dn = d.data()?.len() / h;
+                    }
+                    gu_all.extend_from_slice(&g.data()?);
+                    gu_all.extend_from_slice(&u.data()?);
+                    dn_all.extend_from_slice(&d.data()?);
+                }
+                if ok {
+                    device_moe = Some(build_device_moe(
+                        &gu_all, &dn_all, e, inter, h, row_gu, row_dn,
+                        cfg.num_experts_per_tok.unwrap_or(8), &dev,
+                    )?);
+                    assembled = true;
+                }
+            }
+            if !assembled {
+                for i in 0..e {
+                    experts.push(Mlp::new(h, inter, vb.pp(format!("experts.{i}")))?);
+                }
             }
         }
         let (shared_expert, shared_expert_gate) =
@@ -1126,15 +1265,86 @@ impl SparseMoe {
         Ok(Self {
             gate: linear_no_bias(h, e, vb.pp("gate"))?,
             experts,
+            device_moe,
             shared_expert,
             shared_expert_gate,
             top_k: cfg.num_experts_per_tok.unwrap_or(8),
         })
     }
 
+    /// A5b: fully device-resident MoE step for one token. Fixed shapes,
+    /// fixed pointers, zero host readouts -> legal inside graph capture.
+    fn forward_device_one(&self, dm: &DeviceMoe, xt: &Tensor) -> Result<Tensor> {
+        use candle_nn::fused::static_decode as sd;
+        // Router logits -> f32 buffer (copy_into keeps the pointer stable).
+        let logits = self.gate.forward(xt)?.to_dtype(DType::F32)?.flatten_all()?;
+        sd::copy_into(&dm.logits32, &logits)?;
+        sd::moe_topk_gate(&dm.logits32, &dm.idx, &dm.w, true)?;
+        // Stage the selected experts' quantized rows.
+        {
+            let (gsrc, _) = dm.gu_bytes.storage_and_layout();
+            let (gdst, _) = dm.stage_gu.storage_and_layout();
+            let (dsrc, _) = dm.dn_bytes.storage_and_layout();
+            let (ddst, _) = dm.stage_dn.storage_and_layout();
+            use candle::Storage;
+            let (gsrc, gdst, dsrc, ddst) = match (&*gsrc, &*gdst, &*dsrc, &*ddst) {
+                (Storage::Cuda(a), Storage::Cuda(b), Storage::Cuda(c), Storage::Cuda(d)) => (a, b, c, d),
+                _ => candle::bail!("device MoE requires cuda storage"),
+            };
+            sd::moe_gather_qrows(gsrc, &dm.idx, gdst, 2 * dm.inter, dm.row_gu, self.top_k)?;
+            sd::moe_gather_qrows(dsrc, &dm.idx, ddst, dm.h, dm.row_dn, self.top_k)?;
+        }
+        // x -> f32 stable buffer.
+        let xf = xt.to_dtype(DType::F32)?.flatten_all()?;
+        sd::copy_into(&dm.x32, &xf)?;
+        // Gate/up GEMV over all staged rows in one launch.
+        {
+            let (st, _) = dm.stage_gu.storage_and_layout();
+            use candle::Storage;
+            let st = match &*st { Storage::Cuda(c) => c, _ => candle::bail!("cuda") };
+            sd::qgemv_q4k_raw(st, 0, &dm.x32, &dm.gu_out, dm.h, self.top_k * 2 * dm.inter)?;
+        }
+        sd::moe_silu_mul(&dm.gu_out, &dm.hbuf, dm.inter, self.top_k)?;
+        // Down GEMV per selected expert (fixed offsets; k launches).
+        {
+            let (st, _) = dm.stage_dn.storage_and_layout();
+            use candle::Storage;
+            let st = match &*st { Storage::Cuda(c) => c, _ => candle::bail!("cuda") };
+            for j in 0..self.top_k {
+                let hj = dm.hbuf.narrow(0, j * dm.inter, dm.inter)?;
+                let pj = dm.part.i(j)?;
+                sd::qgemv_q4k_raw(st, j * dm.h * dm.row_dn, &hj, &pj, dm.inter, dm.h)?;
+            }
+        }
+        sd::moe_weighted_sum(&dm.part, &dm.w, &dm.ybuf, dm.h, self.top_k)?;
+        let mut out = dm.ybuf.to_dtype(xt.dtype())?.reshape((1, 1, dm.h))?;
+        if let (Some(se), Some(sg)) = (&self.shared_expert, &self.shared_expert_gate) {
+            let gate = candle_nn::ops::sigmoid(&sg.forward(xt)?.to_dtype(DType::F32)?)?
+                .to_dtype(xt.dtype())?;
+            let sh = se.forward(xt)?.broadcast_mul(&gate)?;
+            out = (out + sh)?;
+        }
+        Ok(out)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Naive single-token routing (b=1, seq=1 in the scaffold path).
         let (b, s, h) = x.dims3()?;
+        if let Some(dm) = &self.device_moe {
+            // Device path: per-token pipeline (seq>1 loops tokens; decode is
+            // the seq==1 fast path this exists for).
+            if b == 1 {
+                if s == 1 {
+                    return self.forward_device_one(dm, x);
+                }
+                let mut rows = Vec::with_capacity(s);
+                for t in 0..s {
+                    let xt = x.narrow(1, t, 1)?;
+                    rows.push(self.forward_device_one(dm, &xt)?);
+                }
+                return Tensor::cat(&rows, 1);
+            }
+        }
         let flat = x.reshape((b * s, h))?;
         let logits = self.gate.forward(&flat)?.to_dtype(DType::F32)?;
         let probs = candle_nn::ops::softmax_last_dim(&logits)?;
