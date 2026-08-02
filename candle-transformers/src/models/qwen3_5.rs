@@ -394,6 +394,7 @@ impl FullAttention {
         let q = rotary.apply(&q, pos)?;
         let k = rotary.apply(&k, pos)?.contiguous()?;
 
+        let fresh_prefill = self.kv_cache.is_none();
         let (k, v) = match &self.kv_cache {
             None => (k, v),
             Some((pk, pv)) => (
@@ -402,6 +403,27 @@ impl FullAttention {
             ),
         };
         self.kv_cache = Some((k.clone(), v.clone()));
+
+        // A6: flash-attention prefill on full-attention layers (GDN-hybrid:
+        // only these layers have quadratic attention). Native GQA — no
+        // repeat_kv. Gated by feature + EXP1_FLASH_PREFILL=1.
+        if fresh_prefill && seq > 1 && cfg!(feature = "flash-attn") {
+            let use_fa = std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false);
+            if use_fa {
+                let scale = 1.0 / (hd as f64).sqrt();
+                let qf = q.transpose(1, 2)?.contiguous()?; // [b, seq, heads, hd]
+                let kf = k.transpose(1, 2)?.contiguous()?;
+                let vf = v.transpose(1, 2)?.contiguous()?;
+                let out = flash_attn(&qf, &kf, &vf, scale as f32, true)?; // [b, seq, heads, hd]
+                let out = if let Some(gate) = gate {
+                    (out * candle_nn::ops::sigmoid(&gate.contiguous()?)?)?
+                } else {
+                    out
+                };
+                let out = out.reshape((b, seq, self.n_heads * hd))?;
+                return self.o_proj.forward(&out);
+            }
+        }
 
         let rep = self.n_heads / self.n_kv_heads;
         let kx = repeat_kv(&k, rep)?;
@@ -435,6 +457,16 @@ impl FullAttention {
             .reshape((b, seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
     }
+}
+
+#[cfg(feature = "flash-attn")]
+fn flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32, causal: bool) -> Result<Tensor> {
+    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
+}
+
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
+    candle::bail!("compile with '--features flash-attn'")
 }
 
 fn repeat_kv(x: &Tensor, rep: usize) -> Result<Tensor> {
