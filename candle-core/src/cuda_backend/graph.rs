@@ -20,6 +20,22 @@ pub struct CapturedGraph {
     graph: cudarc::driver::CudaGraph,
 }
 
+/// True while a [`CapturedGraph::capture`] closure is running. Lets
+/// allocation-sensitive code (e.g. the mmq workspaces) fail loudly instead
+/// of corrupting a capture with a mid-capture reallocation.
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_capturing() -> bool {
+    CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct CaptureFlagGuard;
+impl Drop for CaptureFlagGuard {
+    fn drop(&mut self) {
+        CAPTURING.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl CapturedGraph {
     /// Record all GPU work issued by `f` on `dev`'s stream into a graph.
     /// `f` should perform one representative iteration (e.g. one decode
@@ -29,6 +45,8 @@ impl CapturedGraph {
         stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(crate::Error::wrap)?;
+        CAPTURING.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _flag = CaptureFlagGuard;
         // Run the workload; on failure, make sure capture mode is exited
         // before propagating so the stream is left usable.
         let run = f();

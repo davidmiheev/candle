@@ -154,6 +154,13 @@ fn workspace_ensure(
         match guard.get(&device_key).copied() {
             Some(mtx) => mtx,
             None => {
+                if crate::cuda_backend::graph::is_capturing() {
+                    crate::bail!(
+                        "mmq workspace first-alloc during CUDA graph capture ({} bytes): \
+                         run one eager step at the same shapes before capturing",
+                        bytes
+                    );
+                }
                 let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
                 let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot {
                     slice,
@@ -166,6 +173,14 @@ fn workspace_ensure(
     };
     let mut slot = device_mtx.lock().unwrap();
     if slot.cap < bytes {
+        if crate::cuda_backend::graph::is_capturing() {
+            crate::bail!(
+                "mmq workspace grow during CUDA graph capture ({} -> {} bytes): \
+                 the pre-capture warmup ran at smaller shapes than the captured step",
+                slot.cap,
+                bytes
+            );
+        }
         slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
         slot.cap = bytes;
     }
