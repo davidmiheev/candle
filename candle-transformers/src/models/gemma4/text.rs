@@ -1194,11 +1194,23 @@ impl Attention {
             (&self.rotary_emb_global.cos, &self.rotary_emb_global.sin)
         };
 
+        let dbg_nf = |tag: &str, t: &Tensor| {
+            if std::env::var("GEMMA4_ATTN_DEBUG").is_ok() {
+                let n = t
+                    .to_dtype(DType::F32)
+                    .and_then(|x| x.flatten_all()?.to_vec1::<f32>())
+                    .map(|v| v.iter().filter(|x| x.is_nan()).count())
+                    .unwrap_or(usize::MAX);
+                eprintln!("[q-dbg] {tag}: nan={n}");
+            }
+        };
         let q = self.q_proj.forward(xs)?;
+        dbg_nf("q_proj", &q);
         let q = q
             .reshape((1, t_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
         let q = self.q_norm.forward(&q)?;
+        dbg_nf("q_norm", &q);
 
         let (kbuf, vbuf, q) = if self.is_kv_shared {
             let q = rope_gather(&q, cos_t, sin_t)?;
@@ -1228,7 +1240,9 @@ impl Attention {
             let k = k_norm.forward(&k_raw)?;
             let v = v_norm(&v_raw, self.rms_norm_eps)?;
             let q = rope_gather(&q, cos_t, sin_t)?;
+            dbg_nf("q_rope", &q);
             let k = rope_gather(&k, cos_t, sin_t)?;
+            dbg_nf("k_rope", &k);
 
             if self.static_kv.is_none() {
                 let dev = xs.device();
@@ -1272,7 +1286,33 @@ impl Attention {
         let attn = q.contiguous()?.matmul(&kfull.transpose(2, 3)?)?; // [1,h,C,cap]
         let attn = attn.to_dtype(DType::F32)?;
         let attn = attn.broadcast_add(&mask.reshape((1, 1, t_len, ctx.max_seq))?)?;
+        if std::env::var("GEMMA4_ATTN_DEBUG").is_ok() {
+            let nf = |t: &Tensor| -> usize {
+                t.to_dtype(DType::F32)
+                    .and_then(|x| x.flatten_all()?.to_vec1::<f32>())
+                    .map(|v| v.iter().filter(|x| x.is_nan()).count())
+                    .unwrap_or(usize::MAX)
+            };
+            let mx = |t: &Tensor| -> f32 {
+                t.to_dtype(DType::F32)
+                    .and_then(|x| x.flatten_all()?.to_vec1::<f32>())
+                    .map(|v| v.iter().cloned().filter(|x| x.is_finite()).fold(f32::MIN, f32::max))
+                    .unwrap_or(f32::NAN)
+            };
+            eprintln!(
+                "[attn-dbg] sliding={} q_nan={} k_nan={} v_nan={} premask_scores_nan={} masked_nan={} max_score={:.2}",
+                self.is_sliding, nf(&q), nf(&kbuf), nf(&vbuf), 0, nf(&attn), mx(&attn)
+            );
+        }
         let attn = candle_nn::ops::softmax_last_dim(&attn)?.to_dtype(q.dtype())?;
+        if std::env::var("GEMMA4_ATTN_DEBUG").is_ok() {
+            let n = attn
+                .to_dtype(DType::F32)
+                .and_then(|x| x.flatten_all()?.to_vec1::<f32>())
+                .map(|v| v.iter().filter(|x| x.is_nan()).count())
+                .unwrap_or(usize::MAX);
+            eprintln!("[attn-dbg]   post-softmax nan={n}");
+        }
         let out = attn.matmul(&vfull)?;
         out.transpose(1, 2)?
             .reshape((1, t_len, ()))?
@@ -1663,6 +1703,14 @@ impl DecoderLayer {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward_static_chunk_dev(&xs, ctx, shared_kv)?;
+        if std::env::var("GEMMA4_CHUNK_DEBUG").is_ok() {
+            if let Ok(v) = xs
+                .to_dtype(DType::F32)
+                .and_then(|x| x.abs()?.mean_all()?.to_scalar::<f32>())
+            {
+                eprintln!("[chunk-dbg]   post-attn: mean_abs={v:.5}");
+            }
+        }
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
             &xs,
@@ -1673,6 +1721,14 @@ impl DecoderLayer {
         )?;
         let residual = &xs_res;
         let xs = ffw_in.apply(&self.mlp)?;
+        if std::env::var("GEMMA4_CHUNK_DEBUG").is_ok() {
+            if let Ok(v) = xs
+                .to_dtype(DType::F32)
+                .and_then(|x| x.abs()?.mean_all()?.to_scalar::<f32>())
+            {
+                eprintln!("[chunk-dbg]   post-mlp: mean_abs={v:.5}");
+            }
+        }
         let xs = match self.moe.as_ref() {
             Some(moe) => moe.forward(&xs, residual)?,
             None => xs,
@@ -2201,6 +2257,31 @@ impl TextModel {
         sd::iota_add_u32(&cctx.rope_idx, &ctx.pos)?;
         sd::chunk_mask_from_pos(&cctx.mask_global, &ctx.pos, None)?;
         sd::chunk_mask_from_pos(&cctx.mask_sliding, &ctx.pos, Some(ctx.sliding_window))?;
+        if std::env::var("GEMMA4_CHUNK_SYNC").is_ok() {
+            self.device.synchronize()?;
+        }
+        if std::env::var("GEMMA4_MASK_DEBUG").is_ok() {
+            let pos_v = ctx.pos.to_vec1::<u32>()?[0];
+            let m = cctx.mask_sliding.to_vec2::<f32>()?;
+            let row_stat = |r: usize| -> (usize, i32, i32) {
+                let row = &m[r];
+                let valid = row.iter().filter(|v| **v == 0.0).count();
+                let first = row.iter().position(|v| *v == 0.0).map(|i| i as i32).unwrap_or(-1);
+                let last = row.iter().rposition(|v| *v == 0.0).map(|i| i as i32).unwrap_or(-1);
+                (valid, first, last)
+            };
+            let garbage = m
+                .iter()
+                .flatten()
+                .filter(|v| **v != 0.0 && !v.is_infinite())
+                .count();
+            eprintln!(
+                "[mask-dbg] pos={pos_v} rows={} row0={:?} rowLast={:?} nonzero-noninf={garbage}",
+                m.len(),
+                row_stat(0),
+                row_stat(m.len() - 1)
+            );
+        }
         let ids = cctx.ids.clone();
         let dbg = std::env::var("GEMMA4_CHUNK_DEBUG").is_ok();
         let trace = |tag: &str, t: &Tensor| {

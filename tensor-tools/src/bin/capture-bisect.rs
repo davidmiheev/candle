@@ -176,7 +176,11 @@ fn main() -> anyhow::Result<()> {
     for &b in &batches {
         let cell = || -> anyhow::Result<()> {
         eprintln!("[cell b={b}] input");
-        let x_host: Vec<f32> = (0..b * k).map(|i| f(i, 1.309)).collect();
+        let scale: f32 = std::env::var("BISECT_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0);
+        let x_host: Vec<f32> = (0..b * k).map(|i| f(i, 1.309) * scale).collect();
         let x = Tensor::from_vec(x_host, (1, b, k), &Device::Cpu)?
             .to_dtype(DType::BF16)?
             .to_device(&dev)?;
