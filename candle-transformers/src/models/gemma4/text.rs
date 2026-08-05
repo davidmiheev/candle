@@ -778,17 +778,32 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let bias = cfg.attention_bias;
         let is_sliding = cfg.is_sliding(layer_idx);
-        // Diagnostic knob (batch-2): GEMMA4_SKIP_QUANT_GLOBAL=1 keeps the
-        // full-attention (global) layers' projections unquantized while the
-        // sliding layers stay quantized — isolates whether long-range
-        // retrieval collapse (>~2x sliding_window) is caused by quantized
-        // global-layer projections (raw tensors must be present in the
-        // safetensors sources, e.g. a selective globals file).
-        let quant = if !is_sliding
-            && std::env::var("GEMMA4_SKIP_QUANT_GLOBAL").map(|v| v == "1").unwrap_or(false)
-        {
-            eprintln!("[gemma4] layer {layer_idx}: global projections UNQUANTIZED (skip-quant knob)");
-            None
+        // Global (full-attention) layers keep their projections UNQUANTIZED
+        // by default (batch-2 root cause: q4k error on the k_eq_v global
+        // projections collapses retrieval beyond the sliding window — with
+        // bf16 globals 31b recalls the needle EXACTLY at 2.4k where it
+        // previously degenerated; ~0.4-3.7 GB extra per model). Requires the
+        // raw tensors in the safetensors sources (aux-v6 ships them); falls
+        // back to the quantized path with a warning when they're absent so
+        // older aux files keep loading. GEMMA4_QUANT_GLOBAL=1 forces the old
+        // fully-quantized behavior.
+        let quant = if !is_sliding && quant.is_some() {
+            let force_quant =
+                std::env::var("GEMMA4_QUANT_GLOBAL").map(|v| v == "1").unwrap_or(false);
+            let raw_avail =
+                vb.contains_tensor("q_proj.weight") && vb.contains_tensor("o_proj.weight");
+            if force_quant {
+                quant
+            } else if raw_avail {
+                eprintln!("[gemma4] layer {layer_idx}: global projections unquantized (default)");
+                None
+            } else {
+                eprintln!(
+                    "[gemma4] layer {layer_idx}: raw global projections unavailable — \
+                     falling back to quantized (long-context quality degraded; ship aux-v6)"
+                );
+                quant
+            }
         } else {
             quant
         };
@@ -2267,10 +2282,13 @@ impl TextModel {
         if self.static_ctx.is_none() {
             candle::bail!("static decode not enabled");
         }
+        // Default 256: the MMQ batch path mis-computes at 512-row chunks on
+        // sm_120 (batch-2; chunk-256 and FORCE_DMMV are clean). Revisit after
+        // the kernel fix.
         let chunk = std::env::var("GEMMA4_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(512)
+            .unwrap_or(256)
             .max(1);
         let mut pos = 0usize;
         let mut last: Option<Tensor> = None;
