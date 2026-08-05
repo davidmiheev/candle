@@ -2282,13 +2282,15 @@ impl TextModel {
         if self.static_ctx.is_none() {
             candle::bail!("static decode not enabled");
         }
-        // Default 256: the MMQ batch path mis-computes at 512-row chunks on
-        // sm_120 (batch-2; chunk-256 and FORCE_DMMV are clean). Revisit after
-        // the kernel fix.
+        // Default 512. Batch-3 correctness matrix: with bf16 globals (aux-v6)
+        // chunk 512 is EXACT at 2.4k while chunk 256 degenerates there; with
+        // quantized globals the pattern inverts at 1.9k. The chunked-prefill
+        // machinery has chunk-size-dependent bugs under investigation (kernel
+        // session) — 512 is the correct default for the aux-v6 serving path.
         let chunk = std::env::var("GEMMA4_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(256)
+            .unwrap_or(512)
             .max(1);
         let mut pos = 0usize;
         let mut last: Option<Tensor> = None;
