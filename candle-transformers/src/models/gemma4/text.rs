@@ -1284,8 +1284,19 @@ impl Attention {
             &cctx.mask_global
         };
         let attn = q.contiguous()?.matmul(&kfull.transpose(2, 3)?)?; // [1,h,C,cap]
-        let attn = attn.to_dtype(DType::F32)?;
-        let attn = attn.broadcast_add(&mask.reshape((1, 1, t_len, ctx.max_seq))?)?;
+        // Match the host/dynamic paths' dtype ordering (bf16 mask-add +
+        // softmax). The old F32-upcast ordering attenuated long-range
+        // attention step-proportionally at scale (batch-4 root cause #2:
+        // needle logit sank ~0.5/chunk, killing retrieval past ~2 chunks) —
+        // exact mechanism filed as a softmax-kernel question;
+        // GEMMA4_DEV_SOFTMAX_F32=1 restores the old ordering for study.
+        let attn = if std::env::var("GEMMA4_DEV_SOFTMAX_F32").map(|v| v == "1").unwrap_or(false) {
+            let attn = attn.to_dtype(DType::F32)?;
+            attn.broadcast_add(&mask.reshape((1, 1, t_len, ctx.max_seq))?)?
+        } else {
+            let m16 = mask.reshape((1, 1, t_len, ctx.max_seq))?.to_dtype(attn.dtype())?;
+            attn.broadcast_add(&m16)?
+        };
         if std::env::var("GEMMA4_ATTN_DEBUG").is_ok() {
             let nf = |t: &Tensor| -> usize {
                 t.to_dtype(DType::F32)
