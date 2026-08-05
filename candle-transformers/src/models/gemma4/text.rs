@@ -2202,7 +2202,19 @@ impl TextModel {
         sd::chunk_mask_from_pos(&cctx.mask_global, &ctx.pos, None)?;
         sd::chunk_mask_from_pos(&cctx.mask_sliding, &ctx.pos, Some(ctx.sliding_window))?;
         let ids = cctx.ids.clone();
+        let dbg = std::env::var("GEMMA4_CHUNK_DEBUG").is_ok();
+        let trace = |tag: &str, t: &Tensor| {
+            if dbg {
+                if let Ok(v) = t
+                    .to_dtype(DType::F32)
+                    .and_then(|x| x.abs()?.mean_all()?.to_scalar::<f32>())
+                {
+                    eprintln!("[chunk-dbg] {tag}: mean_abs={v:.5} finite={}", v.is_finite());
+                }
+            }
+        };
         let xs = self.embed_tokens(&ids)?;
+        trace("embed", &xs);
         let per_layer_inputs = self.per_layer_inputs(&ids, &xs)?;
         let mut shared_kv = SharedKvStates::default();
         let mut xs = xs;
@@ -2212,6 +2224,7 @@ impl TextModel {
                 None => None,
             };
             xs = layer.forward_static_chunk_dev(&xs, pli.as_ref(), &ctx, &mut shared_kv)?;
+            trace(&format!("layer{layer_idx}"), &xs);
         }
         sd::incr_add_u32(&ctx.pos, cctx.chunk as u32)?;
         // Return the full chunk hidden (cheap) + row C-1 logits; when the
@@ -2417,6 +2430,169 @@ mod tests {
             }"#,
         )
         .expect("test config parses")
+    }
+
+    /// Dense tiny config (no MoE) with a k_eq_v global layer — the batch-4
+    /// chunk-machinery parity surface.
+    fn dense_test_config() -> Gemma4TextConfig {
+        serde_json::from_str(
+            r#"{
+              "attention_k_eq_v": true,
+              "hidden_size": 32,
+              "intermediate_size": 64,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "num_global_key_value_heads": 1,
+              "head_dim": 8,
+              "global_head_dim": 16,
+              "num_hidden_layers": 4,
+              "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+              "sliding_window": 8,
+              "max_position_embeddings": 128,
+              "vocab_size": 256,
+              "final_logit_softcapping": 30.0,
+              "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+              }
+            }"#,
+        )
+        .expect("test config parses")
+    }
+
+    /// Deterministic non-zero weights: learn names/shapes via a VarMap build,
+    /// then rebuild a from_tensors VarBuilder (norms near 1, rest small).
+    fn dense_test_weights(cfg: &Gemma4TextConfig, dev: &Device) -> Result<std::collections::HashMap<String, Tensor>> {
+        let varmap = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+        let _ = TextModel::new(cfg, vb)?;
+        fn h(i: usize, seed: f32) -> f32 {
+            let x = (i as f32) * seed;
+            (x.sin() * 43758.547).fract() - 0.5
+        }
+        let mut map = std::collections::HashMap::new();
+        let data = varmap.data().lock().unwrap();
+        for (si, (name, var)) in data.iter().enumerate() {
+            let dims = var.as_tensor().dims().to_vec();
+            let n: usize = dims.iter().product();
+            let base = if name.contains("norm") { 1.0 } else { 0.0 };
+            let scale = if name.contains("norm") { 0.05 } else { 0.15 };
+            let vals: Vec<f32> = (0..n)
+                .map(|i| base + scale * h(i, 0.31 + si as f32 * 0.017))
+                .collect();
+            map.insert(name.clone(), Tensor::from_vec(vals, dims, dev)?);
+        }
+        Ok(map)
+    }
+
+    /// Batch-4: dynamic vs eager-chunked (chunk 4 and 8) vs CAPTURED chunk
+    /// graph — full parity + finiteness on CUDA with quantized projections.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn chunk_graph_parity_tiny() -> Result<()> {
+        use candle::cuda_backend::graph::CapturedGraph;
+        let dev = Device::new_cuda(0)?;
+        let cuda = match &dev {
+            Device::Cuda(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        let cfg = dense_test_config();
+        let weights = dense_test_weights(&cfg, &dev)?;
+        let ids: Vec<u32> = (0..20u32).map(|i| (i * 37 + 11) % 256).collect();
+        let ids_t = Tensor::from_vec(ids.clone(), (1, ids.len()), &dev)?;
+
+        let build = || -> Result<TextModel> {
+            // Prod runs BF16 activations on CUDA (static-decode ops are
+            // dtype-strict) — convert the deterministic weights to BF16.
+            let bf: std::collections::HashMap<String, Tensor> = weights
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), v.to_dtype(DType::BF16)?)))
+                .collect::<Result<_>>()?;
+            let vb = VarBuilder::from_tensors(bf, DType::BF16, &dev);
+            TextModel::new_with_quant(&cfg, vb, Some(GgmlDType::Q8_0))
+        };
+        let vec_of = |t: &Tensor| -> Result<Vec<f32>> {
+            t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()
+        };
+        let results: std::cell::RefCell<Vec<(String, f32, usize)>> = Default::default();
+        let cmp = |tag: &str, a: &[f32], b: &[f32]| {
+            let nan = b.iter().filter(|v| !v.is_finite()).count();
+            let max_rel = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs() / x.abs().max(1e-3))
+                .fold(0f32, f32::max);
+            eprintln!("[parity] {tag}: max_rel={max_rel:.5} nan={nan}");
+            results.borrow_mut().push((tag.to_string(), max_rel, nan));
+        };
+
+        // Reference: dynamic forward, last-position logits.
+        let mut m_dyn = build()?;
+        let logits_dyn = m_dyn.forward(&ids_t, 0)?;
+        let r_dyn = vec_of(&logits_dyn)?;
+
+        // Eager static chunked at chunk 8 and 4.
+        for chunk in [8usize, 4] {
+            std::env::set_var("GEMMA4_PREFILL_CHUNK", chunk.to_string());
+            let mut m = build()?;
+            m.enable_static_decode(32)?;
+            let lg = m.prefill_static_chunked(&ids_t)?;
+            cmp(&format!("eager-chunk{chunk} vs dynamic"), &r_dyn, &vec_of(&lg)?);
+        }
+        std::env::remove_var("GEMMA4_PREFILL_CHUNK");
+
+        // Device-driven chunk step EAGERLY (no capture): same masks/rope-from-
+        // device-pos machinery via the fork's own driver. Separates step-
+        // machinery bugs from capture/replay bugs.
+        for chunk in [20usize, 10, 8, 4] {
+            // 20 = single chunk no padding; 10 = two chunks no padding;
+            // 8 = three chunks with 4 pad tokens.
+            let mut m = build()?;
+            m.enable_static_decode(32)?;
+            m.enable_chunk_graph(chunk)?;
+            let lg = m.prefill_static_graph(&ids_t)?;
+            cmp(&format!("eager-devstep-chunk{chunk} vs dynamic"), &r_dyn, &vec_of(&lg)?);
+        }
+
+        // Captured chunk graph (exp1 driver flow), chunk 8: 20 tokens -> 3
+        // padded chunks; logits derived from the real last row.
+        let chunk = 8usize;
+        let mut m = build()?;
+        m.enable_static_decode(32)?;
+        m.enable_chunk_graph(chunk)?;
+        let total = ids.len();
+        let n_chunks = total.div_ceil(chunk);
+        let mut padded = ids.clone();
+        padded.resize(n_chunks * chunk, 0);
+        let _htod = cuda.enable_cuda_graph_htod_cache();
+        m.feed_chunk_ids(&padded[..chunk])?;
+        let _ = m.prefill_chunk_step()?;
+        m.reset_static_pos()?;
+        m.feed_chunk_ids(&padded[..chunk])?;
+        let mut cap: Option<(Tensor, Tensor)> = None;
+        let g = CapturedGraph::capture(&cuda, || {
+            cap = Some(m.prefill_chunk_step()?);
+            Ok(())
+        })?;
+        let (hidden_buf, _logits_buf) = cap.unwrap();
+        m.reset_static_pos()?;
+        for c in 0..n_chunks {
+            m.feed_chunk_ids(&padded[c * chunk..(c + 1) * chunk])?;
+            g.replay()?;
+        }
+        candle_nn::fused::static_decode::write_u32(m.static_pos()?, total as u32)?;
+        let pad = n_chunks * chunk - total;
+        let real = hidden_buf.narrow(1, chunk - 1 - pad, 1)?;
+        let lg = m.logits_from_hidden(&real)?;
+        dev.synchronize()?;
+        cmp("captured-chunk8 vs dynamic", &r_dyn, &vec_of(&lg)?);
+        std::mem::forget(g);
+        // Verdicts: bf16-noise tolerance 0.15 for every cell.
+        for (tag, max_rel, nan) in results.borrow().iter() {
+            assert_eq!(*nan, 0, "{tag}: NaN in logits");
+            assert!(*max_rel < 0.15, "{tag}: diverged (max_rel={max_rel})");
+        }
+        Ok(())
     }
 
     #[test]

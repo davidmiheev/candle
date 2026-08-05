@@ -66,25 +66,137 @@ fn main() -> anyhow::Result<()> {
     let qm = QMatMul::QTensor(std::sync::Arc::new(qw_dev));
     let _ = qw;
 
-    for &b in &[1usize, 8, 256, 512] {
+    // Mode "alt": alternate two weight shapes eagerly at b and compare the
+    // second shape's result against its isolated run — detects cross-call
+    // workspace contamination (stream-k fixup residue).
+    if args.get(1).map(|s| s.as_str()) == Some("alt") {
+        let b: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(512);
+        let k = 5376usize;
+        let (n1, n2) = (8192usize, 4096usize);
+        fn f(i: usize, s: f32) -> f32 {
+            let x = (i as f32) * s;
+            (x.sin() * 43758.547).fract() - 0.5
+        }
+        let mk = |n: usize, seed: f32| -> anyhow::Result<QMatMul> {
+            let w: Vec<f32> = (0..n * k).map(|i| f(i, seed)).collect();
+            let w = Tensor::from_vec(w, (n, k), &Device::Cpu)?;
+            Ok(QMatMul::QTensor(std::sync::Arc::new(QTensor::quantize_onto(
+                &w,
+                GgmlDType::Q4K,
+                &dev,
+            )?)))
+        };
+        let qm1 = mk(n1, 0.7311)?;
+        let qm2 = mk(n2, 0.4177)?;
+        let x: Vec<f32> = (0..b * k).map(|i| f(i, 1.309)).collect();
+        let x = Tensor::from_vec(x, (1, b, k), &Device::Cpu)?
+            .to_dtype(DType::BF16)?
+            .to_device(&dev)?;
+        // Isolated qm2 result (fresh process state for qm2's shape).
+        let y2_iso = qm2.forward(&x)?;
+        dev.synchronize()?;
+        let y2_iso = (&y2_iso * 1.0)?;
+        // Interleaved: qm1 then qm2, repeatedly; compare qm2 each round.
+        for round in 0..4 {
+            let _y1 = qm1.forward(&x)?;
+            let y2 = qm2.forward(&x)?;
+            dev.synchronize()?;
+            let (rel, rms, nan) = max_rel_err(&y2_iso, &y2)?;
+            println!("alt b={b} round={round}: qm2 vs isolated max_rel={rel:.4} rms={rms:.2e} nan={nan}");
+        }
+        return Ok(());
+    }
+
+    // Mode "chain": capture TWO chained quantized matmuls in one graph and
+    // replay — the minimal multi-op composition (prod chunk-step analog).
+    if args.get(1).map(|s| s.as_str()) == Some("chain") {
+        let b: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(512);
+        let k = 5376usize;
+        let mid = 4096usize;
+        fn f(i: usize, s: f32) -> f32 {
+            let x = (i as f32) * s;
+            (x.sin() * 43758.547).fract() - 0.5
+        }
+        let mk = |n_out: usize, n_in: usize, seed: f32| -> anyhow::Result<QMatMul> {
+            let w: Vec<f32> = (0..n_out * n_in).map(|i| f(i, seed) * 0.05).collect();
+            let w = Tensor::from_vec(w, (n_out, n_in), &Device::Cpu)?;
+            Ok(QMatMul::QTensor(std::sync::Arc::new(QTensor::quantize_onto(
+                &w,
+                GgmlDType::Q4K,
+                &dev,
+            )?)))
+        };
+        let qm1 = mk(mid, k, 0.7311)?;
+        let qm2 = mk(k, mid, 0.4177)?;
+        let x: Vec<f32> = (0..b * k).map(|i| f(i, 1.309)).collect();
+        let x = Tensor::from_vec(x, (1, b, k), &Device::Cpu)?
+            .to_dtype(DType::BF16)?
+            .to_device(&dev)?;
+        let chain = |inp: &Tensor| -> candle::Result<Tensor> {
+            let y1 = qm1.forward(inp)?;
+            let y1 = y1.to_dtype(DType::BF16)?;
+            qm2.forward(&y1)
+        };
+        let y_eager = chain(&x)?;
+        dev.synchronize()?;
+        let y_eager = (&y_eager * 1.0)?;
+        // Prod parity: the htod param cache guard is active during prod
+        // capture (generate_static_gemma4) — CHAIN_HTOD=1 enables it here.
+        let _guard = if std::env::var("CHAIN_HTOD").map(|v| v == "1").unwrap_or(false) {
+            println!("htod param cache: ENABLED");
+            Some(cuda.enable_cuda_graph_htod_cache())
+        } else {
+            None
+        };
+        // warmup then capture
+        let _w = chain(&x)?;
+        dev.synchronize()?;
+        let mut cap: Option<Tensor> = None;
+        let g = CapturedGraph::capture(&cuda, || {
+            cap = Some(chain(&x)?);
+            Ok(())
+        })?;
+        let y_buf = cap.unwrap();
+        for r in 0..3 {
+            g.replay()?;
+            dev.synchronize()?;
+            let y = (&y_buf * 1.0)?;
+            let (rel, rms, nan) = max_rel_err(&y_eager, &y)?;
+            println!("chain b={b} replay{r}: vs eager max_rel={rel:.4} rms={rms:.2e} nan={nan}");
+        }
+        std::mem::forget(g);
+        std::mem::forget(y_buf);
+        return Ok(());
+    }
+
+    let batches: Vec<usize> = args
+        .get(4)
+        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 8, 256, 512]);
+    for &b in &batches {
+        let cell = || -> anyhow::Result<()> {
+        eprintln!("[cell b={b}] input");
         let x_host: Vec<f32> = (0..b * k).map(|i| f(i, 1.309)).collect();
         let x = Tensor::from_vec(x_host, (1, b, k), &Device::Cpu)?
             .to_dtype(DType::BF16)?
             .to_device(&dev)?;
 
         // Reference: legacy DMMV path on identical input.
+        eprintln!("[cell b={b}] dmmv ref");
         candle::quantized::cuda::set_force_dmmv(true);
         let y_ref = qm.forward(&x)?;
         dev.synchronize()?;
         candle::quantized::cuda::set_force_dmmv(false);
 
         // Eager fast path.
+        eprintln!("[cell b={b}] eager fast");
         let y_eager = qm.forward(&x)?;
         dev.synchronize()?;
         let (rel_e, rms_e, nan_e) = max_rel_err(&y_ref, &y_eager)?;
 
         // Captured fast path: warmup once (sizes workspaces), then capture
         // one forward into stable in/out buffers and replay twice.
+        eprintln!("[cell b={b}] warm+capture");
         let x_buf = x.zeros_like()?;
         x_buf.slice_set(&x, 0, 0)?;
         let _warm = qm.forward(&x_buf)?;
@@ -103,7 +215,12 @@ fn main() -> anyhow::Result<()> {
         let y_replay2 = (&y_buf * 1.0)?;
         let (rel_c1, rms_c1, nan_c1) = max_rel_err(&y_ref, &y_replay1)?;
         let (rel_c2, rms_c2, nan_c2) = max_rel_err(&y_ref, &y_replay2)?;
-        drop(g);
+        // Dropping the graph frees its capture-time (graph-owned) allocations;
+        // the output tensor then double-frees -> INVALID_VALUE on the next
+        // stream op (reproduced: cells following a drop crashed at input
+        // upload). Leak both — this is a bisect bin.
+        std::mem::forget(g);
+        std::mem::forget(y_buf);
         dev.synchronize()?;
 
         println!(
@@ -111,6 +228,11 @@ fn main() -> anyhow::Result<()> {
              replay1: max_rel={rel_c1:.4} rms={rms_c1:.2e} nan={nan_c1} | \
              replay2: max_rel={rel_c2:.4} rms={rms_c2:.2e} nan={nan_c2}"
         );
+        Ok(())
+        };
+        if let Err(e) = cell() {
+            println!("b={b:4} CELL-ERROR: {e}");
+        }
     }
     Ok(())
 }
