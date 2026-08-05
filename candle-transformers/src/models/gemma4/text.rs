@@ -778,6 +778,20 @@ impl Attention {
         let num_heads = cfg.num_attention_heads;
         let bias = cfg.attention_bias;
         let is_sliding = cfg.is_sliding(layer_idx);
+        // Diagnostic knob (batch-2): GEMMA4_SKIP_QUANT_GLOBAL=1 keeps the
+        // full-attention (global) layers' projections unquantized while the
+        // sliding layers stay quantized — isolates whether long-range
+        // retrieval collapse (>~2x sliding_window) is caused by quantized
+        // global-layer projections (raw tensors must be present in the
+        // safetensors sources, e.g. a selective globals file).
+        let quant = if !is_sliding
+            && std::env::var("GEMMA4_SKIP_QUANT_GLOBAL").map(|v| v == "1").unwrap_or(false)
+        {
+            eprintln!("[gemma4] layer {layer_idx}: global projections UNQUANTIZED (skip-quant knob)");
+            None
+        } else {
+            quant
+        };
 
         let (head_dim, num_kv_heads) = if is_sliding {
             (cfg.head_dim, cfg.num_key_value_heads)
