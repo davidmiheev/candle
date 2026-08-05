@@ -693,9 +693,14 @@ pub(crate) struct SharedKvStates {
 pub struct StaticCtx {
     pub pos: Tensor,          // u32 [1]
     pub mask_global: Tensor,  // f32 [max_seq]
-    pub mask_sliding: Tensor, // f32 [max_seq]
+    pub mask_sliding: Tensor, // f32 [ring_len]
     pub max_seq: usize,
     pub sliding_window: usize,
+    /// Sliding layers' static KV row count. Right-sized to
+    /// `sliding_window + prefill_chunk` (a ring: writes at pos % ring_len,
+    /// ring-aware masks) unless GEMMA4_RING_KV=0 or EXP1_FLASH_PREFILL=1
+    /// pins it to max_seq. Global layers always use max_seq rows.
+    pub ring_len: usize,
     /// A2 chunked-prefill-graph state (allocated by enable_chunk_graph).
     pub chunk: Option<ChunkCtx>,
 }
@@ -707,26 +712,34 @@ pub struct ChunkCtx {
     pub ids: Tensor,          // u32 [1, C] — fed between replays (htod)
     pub rope_idx: Tensor,     // u32 [C] — iota(pos) refreshed in-graph
     pub mask_global: Tensor,  // f32 [C, max_seq]
-    pub mask_sliding: Tensor, // f32 [C, max_seq]
+    pub mask_sliding: Tensor, // f32 [C, ring_len]
     pub chunk: usize,
 }
 
 impl StaticCtx {
-    pub fn new(max_seq: usize, sliding_window: usize, dev: &Device) -> Result<Self> {
+    pub fn new(
+        max_seq: usize,
+        sliding_window: usize,
+        ring_len: usize,
+        dev: &Device,
+    ) -> Result<Self> {
         Ok(Self {
             pos: Tensor::zeros(1, DType::U32, dev)?,
             mask_global: Tensor::zeros(max_seq, DType::F32, dev)?,
-            mask_sliding: Tensor::zeros(max_seq, DType::F32, dev)?,
+            mask_sliding: Tensor::zeros(ring_len, DType::F32, dev)?,
             max_seq,
             sliding_window,
+            ring_len,
             chunk: None,
         })
     }
 
     /// Rewrite both mask rows for the current position (graph-replayable).
+    /// The sliding mask is ring-aware; with ring_len == max_seq the ring
+    /// math reduces exactly to the plain sliding mask.
     pub fn refresh_masks(&self) -> Result<()> {
         candle_nn::fused::static_decode::mask_from_pos(&self.mask_global, &self.pos, 0)?;
-        candle_nn::fused::static_decode::mask_from_pos(
+        candle_nn::fused::static_decode::ring_mask_from_pos(
             &self.mask_sliding,
             &self.pos,
             self.sliding_window,
@@ -1023,17 +1036,55 @@ impl Attention {
             .apply(&self.o_proj)
     }
 
+    /// Lazily allocate (and capacity-check) this layer's static KV buffers:
+    /// global layers get max_seq rows, sliding layers the right-sized ring.
+    /// Returns cheap Arc clones so call sites keep disjoint self borrows.
+    fn static_kv_bufs(
+        &mut self,
+        ctx: &StaticCtx,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let cap = if self.is_sliding {
+            ctx.ring_len
+        } else {
+            ctx.max_seq
+        };
+        match self.static_kv.as_ref() {
+            Some((k, v)) => {
+                if k.dim(1)? != cap {
+                    candle::bail!(
+                        "static KV buffer has {} rows but the context wants {cap} \
+                         (ring resized after buffers allocated?)",
+                        k.dim(1)?
+                    );
+                }
+                Ok((k.clone(), v.clone()))
+            }
+            None => {
+                let shape = (self.num_kv_heads, cap, self.head_dim);
+                let k = Tensor::zeros(shape, dtype, dev)?;
+                let v = Tensor::zeros(shape, dtype, dev)?;
+                self.static_kv = Some((k.clone(), v.clone()));
+                Ok((k, v))
+            }
+        }
+    }
+
     /// Chunked prefill into the static KV buffers: processes [1, T, hidden]
     /// at once (batched projections + rope with host offset), writes K/V
     /// rows [pos, pos+T) via kv_write_chunk, and attends over the buffer
     /// prefix with the same mask builder as the dynamic path. EAGER ONLY —
     /// host `pos` makes this non-replayable; decode uses forward_static.
+    /// `sliding_ring_mask` is the per-chunk ring-aware mask ([T, ring_len],
+    /// built once by the driver) — present iff sliding buffers are rings.
     fn forward_static_chunk(
         &mut self,
         xs: &Tensor, // [1, T, hidden]
         ctx: &StaticCtx,
         shared_kv: &mut SharedKvStates,
         pos: usize,
+        sliding_ring_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, t_len, _) = xs.dims3()?;
         debug_assert_eq!(b_sz, 1);
@@ -1084,23 +1135,15 @@ impl Attention {
                 self.rotary_emb_global.apply_rotary_emb_qkv(&q, &k, pos)?
             };
 
-            if self.static_kv.is_none() {
-                let dev = xs.device();
-                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
-                self.static_kv = Some((
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                ));
-            }
-            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            let (kbuf, vbuf) = self.static_kv_bufs(ctx, xs.dtype(), xs.device())?;
             let kc = k
                 .reshape((self.num_kv_heads, t_len, self.head_dim))?
                 .contiguous()?;
             let vc = v
                 .reshape((self.num_kv_heads, t_len, self.head_dim))?
                 .contiguous()?;
-            candle_nn::fused::static_decode::kv_write_chunk(kbuf, &kc, pos)?;
-            candle_nn::fused::static_decode::kv_write_chunk(vbuf, &vc, pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk(&kbuf, &kc, pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk(&vbuf, &vc, pos)?;
             if self.store_full_length_kv {
                 let slot = if self.is_sliding {
                     &mut shared_kv.sliding
@@ -1109,7 +1152,7 @@ impl Attention {
                 };
                 *slot = Some((kbuf.clone(), vbuf.clone()));
             }
-            (kbuf.clone(), vbuf.clone(), q)
+            (kbuf, vbuf, q)
         };
 
         // A6: FA2 prefill path (EXP1_FLASH_PREFILL=1, feature "flash-attn").
@@ -1143,6 +1186,29 @@ impl Attention {
                 candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, true)?
             };
             return out.reshape((1, t_len, ()))?.apply(&self.o_proj);
+        }
+
+        // Ring-sized sliding buffers: rows live at absolute % ring_len, so
+        // the prefix-narrow below would be wrong — attend over the WHOLE
+        // ring with the driver's ring-aware chunk mask instead. Dtype
+        // ordering matches the host path (bf16 mask-add + softmax).
+        if self.is_sliding {
+            if let Some(rm) = sliding_ring_mask {
+                let cap = kbuf.dim(1)?;
+                let kfull = kbuf.unsqueeze(0)?;
+                let vfull = vbuf.unsqueeze(0)?;
+                let kfull = crate::utils::repeat_kv(kfull, self.num_kv_groups)?.contiguous()?;
+                let vfull = crate::utils::repeat_kv(vfull, self.num_kv_groups)?.contiguous()?;
+                let mask = rm.reshape((1, 1, t_len, cap))?.to_dtype(q.dtype())?;
+                let attn = q.contiguous()?.matmul(&kfull.transpose(2, 3)?)?;
+                let attn = attn.broadcast_add(&mask)?;
+                let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+                let out = attn.matmul(&vfull)?;
+                return out
+                    .transpose(1, 2)?
+                    .reshape((1, t_len, ()))?
+                    .apply(&self.o_proj);
+            }
         }
 
         // Attend over the written prefix with the dynamic-path mask builder.
@@ -1244,23 +1310,15 @@ impl Attention {
             let k = rope_gather(&k, cos_t, sin_t)?;
             dbg_nf("k_rope", &k);
 
-            if self.static_kv.is_none() {
-                let dev = xs.device();
-                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
-                self.static_kv = Some((
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                ));
-            }
-            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            let (kbuf, vbuf) = self.static_kv_bufs(ctx, xs.dtype(), xs.device())?;
             let kc = k
                 .reshape((self.num_kv_heads, t_len, self.head_dim))?
                 .contiguous()?;
             let vc = v
                 .reshape((self.num_kv_heads, t_len, self.head_dim))?
                 .contiguous()?;
-            candle_nn::fused::static_decode::kv_write_chunk_at(kbuf, &kc, &ctx.pos)?;
-            candle_nn::fused::static_decode::kv_write_chunk_at(vbuf, &vc, &ctx.pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk_at(&kbuf, &kc, &ctx.pos)?;
+            candle_nn::fused::static_decode::kv_write_chunk_at(&vbuf, &vc, &ctx.pos)?;
             if self.store_full_length_kv {
                 let slot = if self.is_sliding {
                     &mut shared_kv.sliding
@@ -1269,7 +1327,7 @@ impl Attention {
                 };
                 *slot = Some((kbuf.clone(), vbuf.clone()));
             }
-            (kbuf.clone(), vbuf.clone(), q)
+            (kbuf, vbuf, q)
         };
 
         // Fixed-shape attention over the FULL KV extent with the 2D device
@@ -1290,11 +1348,12 @@ impl Attention {
         // needle logit sank ~0.5/chunk, killing retrieval past ~2 chunks) —
         // exact mechanism filed as a softmax-kernel question;
         // GEMMA4_DEV_SOFTMAX_F32=1 restores the old ordering for study.
+        let mcols = mask.dim(1)?; // max_seq (global) or ring_len (sliding)
         let attn = if std::env::var("GEMMA4_DEV_SOFTMAX_F32").map(|v| v == "1").unwrap_or(false) {
             let attn = attn.to_dtype(DType::F32)?;
-            attn.broadcast_add(&mask.reshape((1, 1, t_len, ctx.max_seq))?)?
+            attn.broadcast_add(&mask.reshape((1, 1, t_len, mcols))?)?
         } else {
-            let m16 = mask.reshape((1, 1, t_len, ctx.max_seq))?.to_dtype(attn.dtype())?;
+            let m16 = mask.reshape((1, 1, t_len, mcols))?.to_dtype(attn.dtype())?;
             attn.broadcast_add(&m16)?
         };
         if std::env::var("GEMMA4_ATTN_DEBUG").is_ok() {
@@ -1390,18 +1449,10 @@ impl Attention {
             let q = rope_at_pos(&q, cos_t, sin_t)?;
             let k = rope_at_pos(&k, cos_t, sin_t)?;
 
-            if self.static_kv.is_none() {
-                let dev = xs.device();
-                let shape = (self.num_kv_heads, ctx.max_seq, self.head_dim);
-                self.static_kv = Some((
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                    Tensor::zeros(shape, xs.dtype(), dev)?,
-                ));
-            }
-            let (kbuf, vbuf) = self.static_kv.as_ref().unwrap();
+            let (kbuf, vbuf) = self.static_kv_bufs(ctx, xs.dtype(), xs.device())?;
             candle_nn::fused::static_decode::kv_write(
-                kbuf,
-                vbuf,
+                &kbuf,
+                &vbuf,
                 &k.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
                 &v.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
                 &ctx.pos,
@@ -1414,23 +1465,24 @@ impl Attention {
                 };
                 *slot = Some((kbuf.clone(), vbuf.clone()));
             }
-            (kbuf.clone(), vbuf.clone(), q)
+            (kbuf, vbuf, q)
         };
 
-        // Grouped attention over the full buffer.
+        // Grouped attention over the full buffer (max_seq or ring extent).
         // q: [1, heads, 1, hd] -> [kvh, group, hd]
         let q3 = q.reshape((self.num_kv_heads, self.num_kv_groups, self.head_dim))?;
         let scores = q3
             .contiguous()?
-            .matmul(&kbuf.transpose(1, 2)?.contiguous()?)?; // [kvh, group, max]
+            .matmul(&kbuf.transpose(1, 2)?.contiguous()?)?; // [kvh, group, cap]
         let mask = if self.is_sliding {
             &ctx.mask_sliding
         } else {
             &ctx.mask_global
         };
+        let mlen = mask.elem_count(); // max_seq (global) or ring_len (sliding)
         let scores = scores
             .to_dtype(DType::F32)?
-            .broadcast_add(&mask.reshape((1, 1, ctx.max_seq))?)?;
+            .broadcast_add(&mask.reshape((1, 1, mlen))?)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(kbuf.dtype())?;
         let out = probs.matmul(&vbuf.contiguous()?)?; // [kvh, group, hd]
         out.reshape((1, 1, self.num_heads * self.head_dim))?
@@ -1771,12 +1823,13 @@ impl DecoderLayer {
         ctx: &StaticCtx,
         shared_kv: &mut SharedKvStates,
         pos: usize,
+        sliding_ring_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
-            .forward_static_chunk(&xs, ctx, shared_kv, pos)?;
+            .forward_static_chunk(&xs, ctx, shared_kv, pos, sliding_ring_mask)?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
             &xs,
@@ -2194,10 +2247,38 @@ impl TextModel {
 
     /// Switch this model to the shape-static decode path with a fixed
     /// context budget. Allocates nothing until the first static step.
+    /// Sliding-KV right-sizing: sliding layers only attend within the
+    /// window, so their static buffers can be rings of window + chunk rows
+    /// instead of max_seq (on 31b@8.4k that is most of the KV footprint —
+    /// 50 of 60 layers). GEMMA4_RING_KV=0 disables (full-size buffers);
+    /// EXP1_FLASH_PREFILL=1 disables (the FA2 prefill path narrows the
+    /// buffer prefix [0, klen), which a ring breaks).
+    fn ring_kv_len(&self, max_seq: usize) -> usize {
+        let off = std::env::var("GEMMA4_RING_KV").map(|v| v == "0").unwrap_or(false)
+            || std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false);
+        if off || self.sliding_window == 0 {
+            return max_seq;
+        }
+        let chunk = std::env::var("GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(1);
+        (self.sliding_window + chunk).min(max_seq)
+    }
+
     pub fn enable_static_decode(&mut self, max_seq: usize) -> Result<()> {
+        let ring_len = self.ring_kv_len(max_seq);
+        if ring_len < max_seq {
+            eprintln!(
+                "[gemma4] sliding-KV ring: {ring_len} rows (window {} + chunk) vs max_seq {max_seq}",
+                self.sliding_window
+            );
+        }
         self.static_ctx = Some(StaticCtx::new(
             max_seq,
             self.sliding_window,
+            ring_len,
             &self.device,
         )?);
         Ok(())
@@ -2236,17 +2317,30 @@ impl TextModel {
 
     /// A2: allocate the device-resident chunk state for graphed prefill.
     pub fn enable_chunk_graph(&mut self, chunk: usize) -> Result<()> {
+        let sliding_window = self.sliding_window;
         let ctx = self
             .static_ctx
             .as_mut()
             .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        // The ring was sized from GEMMA4_PREFILL_CHUNK at enable time; a
+        // larger explicit chunk here needs a larger ring. Growing is safe
+        // only before the per-layer buffers lazily allocate (all callers
+        // enable_chunk_graph right after enable_static_decode); a stale
+        // smaller buffer is caught by the alloc-site capacity assert.
+        if ctx.ring_len < ctx.max_seq {
+            let needed = (sliding_window + chunk).min(ctx.max_seq);
+            if needed > ctx.ring_len {
+                ctx.ring_len = needed;
+                ctx.mask_sliding = Tensor::zeros(needed, DType::F32, &self.device)?;
+            }
+        }
         if ctx.chunk.is_none() {
             let dev = self.device.clone();
             ctx.chunk = Some(ChunkCtx {
                 ids: Tensor::zeros((1, chunk), DType::U32, &dev)?,
                 rope_idx: Tensor::zeros(chunk, DType::U32, &dev)?,
                 mask_global: Tensor::zeros((chunk, ctx.max_seq), DType::F32, &dev)?,
-                mask_sliding: Tensor::zeros((chunk, ctx.max_seq), DType::F32, &dev)?,
+                mask_sliding: Tensor::zeros((chunk, ctx.ring_len), DType::F32, &dev)?,
                 chunk,
             });
         }
@@ -2270,7 +2364,7 @@ impl TextModel {
         use candle_nn::fused::static_decode as sd;
         sd::iota_add_u32(&cctx.rope_idx, &ctx.pos)?;
         sd::chunk_mask_from_pos(&cctx.mask_global, &ctx.pos, None)?;
-        sd::chunk_mask_from_pos(&cctx.mask_sliding, &ctx.pos, Some(ctx.sliding_window))?;
+        sd::ring_chunk_mask_from_pos(&cctx.mask_sliding, &ctx.pos, ctx.sliding_window)?;
         if std::env::var("GEMMA4_CHUNK_SYNC").is_ok() {
             self.device.synchronize()?;
         }
@@ -2426,6 +2520,23 @@ impl TextModel {
             let xs = self.embed_tokens(&ids)?;
             let per_layer_inputs = self.per_layer_inputs(&ids, &xs)?;
             let ctx = self.static_ctx.as_ref().unwrap();
+            // Ring-sized sliding buffers: build this chunk's ring-aware
+            // sliding mask ONCE (shared by all layers) with the same kernel
+            // the graphed path uses — the device pos cursor is written to
+            // the chunk base first (nothing else reads it mid-prefill; the
+            // loop's epilogue pins it to the real total as before).
+            let ring_mask = if ctx.ring_len < ctx.max_seq {
+                candle_nn::fused::static_decode::write_u32(&ctx.pos, pos as u32)?;
+                let m = Tensor::zeros((t, ctx.ring_len), DType::F32, &self.device)?;
+                candle_nn::fused::static_decode::ring_chunk_mask_from_pos(
+                    &m,
+                    &ctx.pos,
+                    ctx.sliding_window,
+                )?;
+                Some(m)
+            } else {
+                None
+            };
             let mut shared_kv = SharedKvStates::default();
             let mut xs = xs;
             Self::chunk_fingerprint(&format!("host embed pos={pos}"), &xs);
@@ -2434,7 +2545,14 @@ impl TextModel {
                     Some(p) => Some(p.i((.., .., layer_idx, ..))?),
                     None => None,
                 };
-                xs = layer.forward_static_chunk(&xs, pli.as_ref(), ctx, &mut shared_kv, pos)?;
+                xs = layer.forward_static_chunk(
+                    &xs,
+                    pli.as_ref(),
+                    ctx,
+                    &mut shared_kv,
+                    pos,
+                    ring_mask.as_ref(),
+                )?;
                 Self::chunk_fingerprint(&format!("host L{layer_idx} pos={pos}"), &xs);
             }
             last = Some(xs.narrow(1, t - 1, 1)?);
@@ -2665,13 +2783,17 @@ mod tests {
         // machinery bugs from capture/replay bugs.
         for chunk in [20usize, 10, 8, 4] {
             // 20 = single chunk no padding; 10 = two chunks no padding;
-            // 8 = three chunks with 4 pad tokens.
+            // 8 = three chunks with 4 pad tokens. The env makes the ring
+            // sizing match the cell's chunk (ring = window + chunk < 32 for
+            // the prod-geometry cells => real ring wraparound on 20 tokens).
+            std::env::set_var("GEMMA4_PREFILL_CHUNK", chunk.to_string());
             let mut m = build()?;
             m.enable_static_decode(32)?;
             m.enable_chunk_graph(chunk)?;
             let lg = m.prefill_static_graph(&ids_t)?;
             cmp(&format!("eager-devstep-chunk{chunk} vs dynamic"), &r_dyn, &vec_of(&lg)?);
         }
+        std::env::remove_var("GEMMA4_PREFILL_CHUNK");
 
         // Captured chunk graph (exp1 driver flow), chunk 8: 20 tokens -> 3
         // padded chunks; logits derived from the real last row.
@@ -2706,6 +2828,54 @@ mod tests {
         dev.synchronize()?;
         cmp("captured-chunk8 vs dynamic", &r_dyn, &vec_of(&lg)?);
         std::mem::forget(g);
+
+        // ── Ring-sized sliding-KV cells ────────────────────────────────────
+        // (the eager-chunk cells above already ran on rings: env chunk 8/4
+        // gives ring 16/12 rows < the 20-token prompt => real wraparound).
+        // Captured ring prefill (window 8 + chunk 8 = 16 rows vs max_seq 32):
+        std::env::set_var("GEMMA4_PREFILL_CHUNK", "8");
+        let mut mr = build()?;
+        mr.enable_static_decode(32)?;
+        mr.enable_chunk_graph(chunk)?;
+        mr.feed_chunk_ids(&padded[..chunk])?;
+        let _ = mr.prefill_chunk_step()?;
+        mr.reset_static_pos()?;
+        mr.feed_chunk_ids(&padded[..chunk])?;
+        let mut capr: Option<(Tensor, Tensor)> = None;
+        let gr = CapturedGraph::capture(&cuda, || {
+            capr = Some(mr.prefill_chunk_step()?);
+            Ok(())
+        })?;
+        let (hidden_buf_r, _lbr) = capr.unwrap();
+        mr.reset_static_pos()?;
+        for c in 0..n_chunks {
+            mr.feed_chunk_ids(&padded[c * chunk..(c + 1) * chunk])?;
+            gr.replay()?;
+        }
+        candle_nn::fused::static_decode::write_u32(mr.static_pos()?, total as u32)?;
+        let real_r = hidden_buf_r.narrow(1, chunk - 1 - pad, 1)?;
+        let lgr = mr.logits_from_hidden(&real_r)?;
+        dev.synchronize()?;
+        cmp("captured-ring-chunk8 vs dynamic", &r_dyn, &vec_of(&lgr)?);
+        std::env::remove_var("GEMMA4_PREFILL_CHUNK");
+
+        // Ring decode continuation: fixed tokens through forward_static
+        // (ring decode mask + decode-time wraparound) vs the dynamic path
+        // fed the same continuation.
+        let cont = [7u32, 21, 3, 50];
+        let mut m_ref = build()?;
+        let _ = m_ref.forward(&ids_t, 0)?;
+        for (i, tok) in cont.iter().enumerate() {
+            let tt = Tensor::from_vec(vec![*tok], (1, 1), &dev)?;
+            let lr = m_ref.forward(&tt, total + i)?;
+            let ls = mr.forward_static(&tt)?;
+            cmp(
+                &format!("ring-decode-step{i} vs dynamic"),
+                &vec_of(&lr)?,
+                &vec_of(&ls)?,
+            );
+        }
+        std::mem::forget(gr);
         // Verdicts. Prod geometries (chunk <= window) are asserted; the
         // chunk > window cells (20, 10 with window 8) still hit a residual,
         // mildly flaky NaN — geometry prod never runs (31b 512<1024, E2B

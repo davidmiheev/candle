@@ -135,7 +135,9 @@ FUSED_SWIGLU_OP(__nv_bfloat16, fused_swiglu_bf16)
 // it so a captured graph replays correctly as the position advances.
 
 // Write one new K/V vector into preallocated [heads, max_seq, dim] buffers
-// at the position read from pos.
+// at the position read from pos. The row index is pos MOD the buffer row
+// count: full-size buffers (max_seq rows) see identity, right-sized sliding
+// rings (window+chunk rows) wrap — same kernel serves both.
 template <typename T>
 __device__ void kv_write(
     T* __restrict__ kbuf,          // [heads, max_seq, dim]
@@ -152,7 +154,7 @@ __device__ void kv_write(
     if (idx >= total) return;
     const int h = idx / dim;
     const int d = idx % dim;
-    const unsigned int p = *pos;
+    const unsigned int p = (*pos) % (unsigned int)max_seq;
     const size_t off = ((size_t)h * max_seq + p) * dim + d;
     kbuf[off] = knew[idx];
     vbuf[off] = vnew[idx];
@@ -298,7 +300,8 @@ extern "C" __global__ void kv_write_chunk_bf16(
     const int hd) {
     const int h = blockIdx.x;
     const int r = blockIdx.y; // 0..t
-    __nv_bfloat16* dst = buf + ((size_t)h * max_seq + pos + r) * hd;
+    const unsigned int row = (pos + (unsigned int)r) % (unsigned int)max_seq;
+    __nv_bfloat16* dst = buf + ((size_t)h * max_seq + row) * hd;
     const __nv_bfloat16* s0 = src + ((size_t)h * t + r) * hd;
     for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
 }
@@ -314,7 +317,8 @@ extern "C" __global__ void kv_write_chunk_f32(
     const int hd) {
     const int h = blockIdx.x;
     const int r = blockIdx.y;
-    float* dst = buf + ((size_t)h * max_seq + pos + r) * hd;
+    const unsigned int row = (pos + (unsigned int)r) % (unsigned int)max_seq;
+    float* dst = buf + ((size_t)h * max_seq + row) * hd;
     const float* s0 = src + ((size_t)h * t + r) * hd;
     for (int j = threadIdx.x; j < hd; j += blockDim.x) dst[j] = s0[j];
 }
@@ -463,6 +467,58 @@ extern "C" __global__ void chunk_mask_window_from_pos_f32(
     mask[idx] = (j <= p && j > p - window) ? 0.0f : -INFINITY;
 }
 
+// ── Right-sized sliding-KV ring masks ───────────────────────────────────────
+// Sliding layers' static KV buffers can be rings of cap = window + chunk
+// rows (writes at absolute_pos mod cap). Slot s then holds the NEWEST
+// absolute position a(s) = F - ((F - s) mod cap) <= F, where F is the write
+// frontier. cap = window + chunk is exactly sufficient: any older occupant
+// a(s) - cap is provably outside the window of every query the mask serves
+// (incl. the padded-final-chunk rows the prefill driver writes past the real
+// length — their assumed absolutes stay out-of-window until decode
+// overwrites them). With cap == buffer rows == max_seq these reduce to the
+// plain sliding masks, so full-size buffers keep exact legacy behavior.
+
+// Decode variant: one query at p = *pos (its KV row is written before
+// attention in the same step). visible <=> 0 <= a(s) and p - window < a(s).
+extern "C" __global__ void ring_mask_from_pos_f32(
+    float* __restrict__ mask,          // [cap]
+    const unsigned int* __restrict__ pos,
+    const int cap,
+    const int window) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= cap) return;
+    const int p = (int)(*pos);
+    int diff = (p - s) % cap;
+    if (diff < 0) diff += cap;
+    const int a = p - diff;
+    const bool vis = (a >= 0) && (a > p - window);
+    mask[s] = vis ? 0.0f : -INFINITY;
+}
+
+// Chunk variant: rows queries at absolute p+r; the whole chunk is written
+// before attention, so the frontier is F = p + rows - 1. Future-in-chunk
+// slots (a > p+r) are masked; their overwritten occupants (a - cap) were
+// already out-of-window for row r, so nothing needed is lost.
+extern "C" __global__ void ring_chunk_mask_from_pos_f32(
+    float* __restrict__ mask,          // [rows, cap]
+    const unsigned int* __restrict__ pos,
+    const int rows,
+    const int cap,
+    const int window) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cap) return;
+    const int r = idx / cap;
+    const int s = idx % cap;
+    const int p = (int)(pos[0]);
+    const int f = p + rows - 1;
+    int diff = (f - s) % cap;
+    if (diff < 0) diff += cap;
+    const int a = f - diff;
+    const int q = p + r;
+    const bool vis = (a >= 0) && (a <= q) && (a > q - window);
+    mask[idx] = vis ? 0.0f : -INFINITY;
+}
+
 // KV chunk write at a DEVICE offset: buf[h, pos+t, d] = src[h, t, d]
 // (bf16 payloads as u16; layout [heads, cap, dim] vs src [heads, n, dim]).
 extern "C" __global__ void kv_write_chunk_at_u16(
@@ -480,7 +536,8 @@ extern "C" __global__ void kv_write_chunk_at_u16(
     long hn = idx / dim;
     int t = hn % n;
     int h = hn / n;
-    buf[((long)h * cap + pos[0] + t) * dim + d] = src[((long)h * n + t) * dim + d];
+    const unsigned int row = (pos[0] + (unsigned int)t) % (unsigned int)cap;
+    buf[((long)h * cap + row) * dim + d] = src[((long)h * n + t) * dim + d];
 }
 
 // ── A5: gathered-expert GEMVs (seq=1 MoE decode, bf16 weights) ─────────────

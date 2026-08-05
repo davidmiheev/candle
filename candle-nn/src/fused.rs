@@ -762,6 +762,75 @@ pub mod static_decode {
         Ok(())
     }
 
+    /// Ring-aware sliding decode mask: fill `mask` (`[cap]` f32) for the
+    /// query at `*pos` over a KV ring of `cap` rows (slot s holds the newest
+    /// absolute <= pos congruent to s mod cap). With cap == max_seq this
+    /// equals `mask_from_pos(_, _, window)`.
+    pub fn ring_mask_from_pos(mask: &Tensor, pos: &Tensor, window: usize) -> Result<()> {
+        let dev = cuda_dev(mask)?;
+        let cap = mask.elem_count();
+        if mask.dtype() != DType::F32 {
+            candle::bail!("ring_mask_from_pos: f32 only");
+        }
+        let func = dev.get_or_load_func("ring_mask_from_pos_f32", &kernels::FUSED)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((cap as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ms, mo) = cuda_parts(mask)?;
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(ms, mo, F32, mp, {
+            with_slice!(ps, po, U32, pp, {
+                let cap_i = cap as i32;
+                let win_i = window as i32;
+                let mut b = func.builder();
+                b.arg(&mp);
+                b.arg(&pp);
+                b.arg(&cap_i);
+                b.arg(&win_i);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
+    /// Ring-aware sliding chunk mask `[rows, cap]` (queries at pos..pos+rows
+    /// over a `cap`-row KV ring whose frontier after the chunk's writes is
+    /// pos + rows - 1). With cap == max_seq this equals the plain sliding
+    /// chunk mask.
+    pub fn ring_chunk_mask_from_pos(mask: &Tensor, pos: &Tensor, window: usize) -> Result<()> {
+        let dev = cuda_dev(mask)?;
+        let (rows, cap) = mask.dims2()?;
+        if mask.dtype() != DType::F32 {
+            candle::bail!("ring_chunk_mask_from_pos: f32 only");
+        }
+        let func = dev.get_or_load_func("ring_chunk_mask_from_pos_f32", &kernels::FUSED)?;
+        let n = rows * cap;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (ms, mo) = cuda_parts(mask)?;
+        let (ps, po) = cuda_parts(pos)?;
+        with_slice!(ms, mo, F32, mp, {
+            with_slice!(ps, po, U32, pp, {
+                let rows_i = rows as i32;
+                let cap_i = cap as i32;
+                let win_i = window as i32;
+                let mut b = func.builder();
+                b.arg(&mp);
+                b.arg(&pp);
+                b.arg(&rows_i);
+                b.arg(&cap_i);
+                b.arg(&win_i);
+                unsafe { b.launch(cfg) }.w()?;
+            });
+        });
+        Ok(())
+    }
+
     /// KV chunk write at a DEVICE offset (bf16): buf[h, pos+t, d] = src[h, t, d].
     pub fn kv_write_chunk_at(buf: &Tensor, src: &Tensor, pos: &Tensor) -> Result<()> {
         let dev = cuda_dev(buf)?;
@@ -892,8 +961,11 @@ pub mod static_decode {
         if h2 != kv_heads || hd2 != hd {
             candle::bail!("kv_write_chunk: shape mismatch {:?} vs {:?}", buf.dims(), src.dims());
         }
-        if pos + t > max_seq {
-            candle::bail!("kv_write_chunk: pos {pos} + t {t} exceeds max_seq {max_seq}");
+        // Rows land at (pos + r) % max_seq in-kernel: full-size buffers need
+        // pos + t in range like before; ring buffers (rows < absolute
+        // positions) legitimately wrap, so only the chunk size is bounded.
+        if t > max_seq {
+            candle::bail!("kv_write_chunk: chunk {t} exceeds buffer rows {max_seq}");
         }
         let dev = match buf.device() {
             candle::Device::Cuda(d) => d.clone(),
