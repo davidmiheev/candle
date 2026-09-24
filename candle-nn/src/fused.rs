@@ -1168,3 +1168,162 @@ pub mod static_decode {
         Ok(())
     }
 }
+
+/// CPU builds: the same API, every entry point an error.
+///
+/// Model code calls these helpers only on paths it takes with a CUDA device
+/// (`static_on = ... && device.is_cuda()`), but the calls still have to
+/// resolve. Without this module any crate that merely *mentions* them —
+/// whisper, qwen3_5, paddleocr_vl, unlimited_ocr — fails to compile without
+/// `--features cuda` (51 errors in candle-transformers). The stubs keep a CPU
+/// build working, and turn an accidental CPU call into a runtime error that
+/// says what happened instead of a missing symbol.
+#[cfg(not(feature = "cuda"))]
+#[allow(unused_variables)]
+pub mod static_decode {
+    use candle::{Result, Tensor};
+
+    fn unavailable(op: &str) -> candle::Error {
+        candle::Error::Msg(format!(
+            "static_decode::{op} needs a CUDA device and a build with --features cuda"
+        ))
+    }
+
+    pub fn kv_write(
+        kbuf: &Tensor,
+        vbuf: &Tensor,
+        knew: &Tensor,
+        vnew: &Tensor,
+        pos: &Tensor,
+    ) -> Result<()> {
+        Err(unavailable("kv_write"))
+    }
+
+    pub fn mask_from_pos(mask: &Tensor, pos: &Tensor, window: usize) -> Result<()> {
+        Err(unavailable("mask_from_pos"))
+    }
+
+    pub fn incr_u32(pos: &Tensor) -> Result<()> {
+        Err(unavailable("incr_u32"))
+    }
+
+    pub fn qgemv_q4k_raw(
+        buf: &candle::CudaStorage,
+        buf_byte_offset: usize,
+        y_f32: &Tensor,
+        dst_f32: &Tensor,
+        ncols: usize,
+        nrows: usize,
+    ) -> Result<()> {
+        Err(unavailable("qgemv_q4k_raw"))
+    }
+
+    pub fn moe_gather_qrows(
+        src: &candle::CudaStorage,
+        idx: &Tensor,
+        dst: &candle::CudaStorage,
+        rows_per_expert: usize,
+        row_bytes: usize,
+        k: usize,
+    ) -> Result<()> {
+        Err(unavailable("moe_gather_qrows"))
+    }
+
+    pub fn moe_silu_mul(gu: &Tensor, h: &Tensor, inter: usize, k: usize) -> Result<()> {
+        Err(unavailable("moe_silu_mul"))
+    }
+
+    pub fn moe_weighted_sum(
+        part: &Tensor,
+        w: &Tensor,
+        y: &Tensor,
+        hidden: usize,
+        k: usize,
+    ) -> Result<()> {
+        Err(unavailable("moe_weighted_sum"))
+    }
+
+    pub fn moe_topk_gate(logits: &Tensor, idx: &Tensor, w: &Tensor, renorm: bool) -> Result<()> {
+        Err(unavailable("moe_topk_gate"))
+    }
+
+    pub fn moe_gemv_gateup(
+        wg: &Tensor,  // [E, I, H] bf16
+        wu: &Tensor,  // [E, I, H] bf16
+        x: &Tensor,   // [H] bf16
+        idx: &Tensor, // [k] u32
+        h: &Tensor,   // [k, I] bf16 (out)
+    ) -> Result<()> {
+        Err(unavailable("moe_gemv_gateup"))
+    }
+
+    pub fn moe_gemv_down(
+        wd: &Tensor,  // [E, H, I] bf16
+        h: &Tensor,   // [k, I] bf16
+        idx: &Tensor, // [k] u32
+        w: &Tensor,   // [k] f32
+        y: &Tensor,   // [H] bf16 (out)
+    ) -> Result<()> {
+        Err(unavailable("moe_gemv_down"))
+    }
+
+    pub fn incr_add_u32(pos: &Tensor, delta: u32) -> Result<()> {
+        Err(unavailable("incr_add_u32"))
+    }
+
+    pub fn iota_add_u32(out: &Tensor, pos: &Tensor) -> Result<()> {
+        Err(unavailable("iota_add_u32"))
+    }
+
+    pub fn chunk_mask_from_pos(mask: &Tensor, pos: &Tensor, window: Option<usize>) -> Result<()> {
+        Err(unavailable("chunk_mask_from_pos"))
+    }
+
+    pub fn ring_mask_from_pos(mask: &Tensor, pos: &Tensor, window: usize) -> Result<()> {
+        Err(unavailable("ring_mask_from_pos"))
+    }
+
+    pub fn ring_chunk_mask_from_pos(mask: &Tensor, pos: &Tensor, window: usize) -> Result<()> {
+        Err(unavailable("ring_chunk_mask_from_pos"))
+    }
+
+    pub fn kv_write_chunk_at(buf: &Tensor, src: &Tensor, pos: &Tensor) -> Result<()> {
+        Err(unavailable("kv_write_chunk_at"))
+    }
+
+    pub fn incr_ring_u32(slot: &Tensor, prefill: u32, window: u32) -> Result<()> {
+        Err(unavailable("incr_ring_u32"))
+    }
+
+    pub fn argmax_feed(
+        logits: &Tensor,
+        input_buf: &Tensor,
+        history: &Tensor,
+        step: &Tensor,
+    ) -> Result<()> {
+        Err(unavailable("argmax_feed"))
+    }
+
+    pub fn kv_write_chunk(buf: &Tensor, src: &Tensor, pos: usize) -> Result<()> {
+        Err(unavailable("kv_write_chunk"))
+    }
+
+    pub fn gdn_scan(
+        q: &Tensor,     // [t, n_k, d_k]
+        k: &Tensor,     // [t, n_k, d_k]
+        v: &Tensor,     // [t, n_v, d_v]
+        beta: &Tensor,  // [t, n_v]
+        decay: &Tensor, // [t, n_v]
+        s: &Tensor,     // [n_v, d_v, d_k] (mutated)
+    ) -> Result<Tensor> {
+        Err(unavailable("gdn_scan"))
+    }
+
+    pub fn write_u32(t: &Tensor, v: u32) -> Result<()> {
+        Err(unavailable("write_u32"))
+    }
+
+    pub fn copy_into(dst: &Tensor, src: &Tensor) -> Result<()> {
+        Err(unavailable("copy_into"))
+    }
+}
