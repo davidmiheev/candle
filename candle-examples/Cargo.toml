@@ -38,7 +38,12 @@ rubato = { version = "2", optional = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-symphonia = { version = "0.6.0", features = ["all"], optional = true }
+# 0.5, not 0.6: src/audio.rs is written against the 0.5 API (AudioBufferRef,
+# codecs::DecoderOptions, core::conv, core::probe), all of which 0.6 moved or
+# removed. With "0.6.0" every symphonia-gated example -- whisper, encodec,
+# mimi, snac -- fails to compile (6 errors in audio.rs), on 0.6.0 and 0.6.1
+# alike. Porting audio.rs to 0.6 is the alternative; this restores the build.
+symphonia = { version = "0.5.4", features = ["all"], optional = true }
 tokenizers = { workspace = true, features = ["onig"] }
 cpal = { version = "0.17.3", optional = true }
 pdf2image = { version = "0.1.2", optional = true }
