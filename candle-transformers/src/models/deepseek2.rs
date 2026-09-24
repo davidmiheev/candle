@@ -576,11 +576,16 @@ impl Module for Proj {
         match self {
             Self::Plain(lin) => lin.forward(xs),
             Self::Quant { weight, bias } => {
-                let xs = weight.forward(xs)?;
-                match bias {
-                    Some(bias) => xs.broadcast_add(&bias.to_dtype(xs.dtype())?),
-                    None => Ok(xs),
-                }
+                // The CUDA quantized matmul's decode (vector) path reads f32
+                // activations only and upgrades just bf16 itself; f16 fails.
+                // Run the product in f32 and hand back the caller's dtype.
+                let in_dtype = xs.dtype();
+                let ys = weight.forward(&xs.to_dtype(DType::F32)?)?;
+                let ys = match bias {
+                    Some(bias) => ys.broadcast_add(bias)?,
+                    None => ys,
+                };
+                ys.to_dtype(in_dtype)
             }
         }
     }
@@ -590,17 +595,41 @@ impl Module for Proj {
 ///
 /// DeepSeek-V2-Lite trips this twice: the dense MLP's `down_proj` reduces over
 /// 10944 and each expert's over 1408, neither divisible by 256. Both are
-/// multiples of 32, so Q8_0 takes them. Silently producing a broken tensor
-/// instead would be the failure mode worth avoiding.
+/// multiples of 32, which the 32-wide block formats accept, so those layers
+/// take the block format of the same bit width rather than failing or
+/// silently producing a broken tensor.
+///
+/// The width matters: the experts are ~14.4B of the model's 15.7B parameters
+/// and one third of each expert is a `down_proj`. Falling back to Q8_0 (as
+/// this first did) puts the experts alone at ~10.5 GB for a "4-bit" load;
+/// Q4_0 keeps them near 8 GB, which is what lets the model fit a 16 GB card.
 fn quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
-    let needs_256 = matches!(
-        requested,
-        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
-    );
-    if needs_256 && k % 256 != 0 {
-        GgmlDType::Q8_0
-    } else {
-        requested
+    if k % 256 == 0 {
+        return requested;
+    }
+    match requested {
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K => GgmlDType::Q4_0,
+        GgmlDType::Q5K => GgmlDType::Q5_0,
+        GgmlDType::Q6K => GgmlDType::Q8_0,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    #[test]
+    fn k_quants_fall_back_to_the_block_format_of_the_same_width() {
+        // 2048 (hidden) is a multiple of 256: the request stands.
+        assert_eq!(quant_dtype_for(2048, GgmlDType::Q4K), GgmlDType::Q4K);
+        // 1408 (expert down_proj) and 10944 (dense down_proj) are not.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q4K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(10944, GgmlDType::Q3K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q5K), GgmlDType::Q5_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q6K), GgmlDType::Q8_0);
+        // Block formats are 32 wide and need no fallback.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q8_0), GgmlDType::Q8_0);
     }
 }
 
