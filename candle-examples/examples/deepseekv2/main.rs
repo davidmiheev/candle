@@ -9,7 +9,7 @@ use clap::Parser;
 
 use candle_transformers::models::deepseek2::{DeepSeekV2, DeepSeekV2Config};
 
-use candle::{DType, Device, Tensor};
+use candle::{quantized::GgmlDType, DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -149,6 +149,17 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
+    /// Quantize every projection at load time: q8_0, q6k, q5k, q4k, q4_0, q3k
+    /// or q2k. Without this the model loads in full precision, which for
+    /// DeepSeek-V2-Lite is 31.4 GB.
+    #[arg(long)]
+    quant: Option<String>,
+
+    /// Weight dtype: f16, bf16 or f32. Defaults to bf16 on GPU; candle only
+    /// builds its bf16 CUDA kernels for sm_80+, so pass f16 on older cards.
+    #[arg(long)]
+    dtype: Option<String>,
+
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
     tracing: bool,
@@ -254,13 +265,34 @@ fn main() -> Result<()> {
     };
     let device = candle_examples::device(args.cpu)?;
     let (model, device) = {
-        let dtype = if device.is_cpu() {
-            DType::F16
-        } else {
-            DType::BF16
+        // DeepSeek-V2-Lite is 15.7B parameters: 31.4 GB in f16, against the
+        // 16 GB a T4 or a 4080 holds. Without --quant the example can only run
+        // on a card it will not fit on, which is why this flag exists.
+        let quant = match args.quant.as_deref() {
+            None => None,
+            Some("q8_0") => Some(GgmlDType::Q8_0),
+            Some("q6k") => Some(GgmlDType::Q6K),
+            Some("q5k") => Some(GgmlDType::Q5K),
+            Some("q4k") => Some(GgmlDType::Q4K),
+            Some("q4_0") => Some(GgmlDType::Q4_0),
+            Some("q3k") => Some(GgmlDType::Q3K),
+            Some("q2k") => Some(GgmlDType::Q2K),
+            Some(other) => anyhow::bail!(
+                "unknown --quant {other}; expected one of q8_0 q6k q5k q4k q4_0 q3k q2k"
+            ),
+        };
+        // candle's bf16 kernels exist only in sm_80+ builds; f16 is what an
+        // older card can run, and quantized projections compute in f32 anyway.
+        let dtype = match args.dtype.as_deref() {
+            Some("f16") => DType::F16,
+            Some("bf16") => DType::BF16,
+            Some("f32") => DType::F32,
+            Some(other) => anyhow::bail!("unknown --dtype {other}; expected f16, bf16 or f32"),
+            None if device.is_cpu() => DType::F16,
+            None => DType::BF16,
         };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-        let model = DeepSeekV2::new(&config, vb)?;
+        let model = DeepSeekV2::new_with_quant(&config, vb, quant)?;
         (model, device)
     };
 
