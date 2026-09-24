@@ -495,8 +495,13 @@ impl Module for ImageEncoderViT {
                 // differs from the pretrain grid.
                 let tgt = xs.dim(1)?;
                 let src = pos_embed.dim(1)?;
+                // broadcast_add, not add: the learned grid is [1, h, w, c] and
+                // a batch of crops is [n, h, w, c]. Plain `+` requires equal
+                // shapes, so batching the encoder (Unlimited-OCR's tiled path
+                // sends 8 crops at a time) fails here with a shape mismatch.
+                // Identical to `+` when n == 1.
                 if tgt == src {
-                    (xs + pos_embed)?
+                    xs.broadcast_add(pos_embed)?
                 } else {
                     let dim = pos_embed.dim(3)?;
                     let f = pos_embed.to_dtype(candle::DType::F32)?;
@@ -510,7 +515,7 @@ impl Module for ImageEncoderViT {
                         pos_embed.device(),
                     )?
                     .to_dtype(pos_embed.dtype())?;
-                    (xs + p)?
+                    xs.broadcast_add(&p)?
                 }
             }
             None => xs,

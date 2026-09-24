@@ -11,7 +11,7 @@
 //! parity bring-up; the R-SWA ring-buffer static path lands on top of it
 //! (see the session docs for the extracted algorithm).
 
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, RmsNorm, VarBuilder};
 
 fn default_rope_theta() -> f64 {

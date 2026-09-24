@@ -234,7 +234,11 @@ impl DeepEncoder {
             let f2 = self.clip.forward(&f1)?; // [m, 101, 1024]
             let (b, c, gh, gw) = f1.dims4()?;
             let sam_seq = f1.reshape((b, c, gh * gw))?.transpose(1, 2)?;
-            let merged = Tensor::cat(&[f2.i((.., 1.., ..))?, sam_seq], 2)?;
+            // .contiguous(): sam_seq is a transpose and the cat of it keeps
+            // non-standard strides, which the batched matmul in the projector
+            // rejects. Harmless at m == 1, which is why the single-view path
+            // never hit it.
+            let merged = Tensor::cat(&[f2.i((.., 1.., ..))?, sam_seq], 2)?.contiguous()?;
             feats.push(self.projector.forward(&merged)?); // [m, 100, d]
             i += m;
         }
