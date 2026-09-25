@@ -166,8 +166,10 @@ impl Model {
             }
         }
 
+        // Multimodal path: PLE inputs are not derivable from mixed embeddings
+        // (would require reversing the text embedding), so they are skipped.
         self.language_model
-            .forward_embeds(&input_embeds, seqlen_offset, b_size, seq_len)
+            .forward_embeds(&input_embeds, None, seqlen_offset, b_size, seq_len)
     }
 
     pub fn clear_kv_cache(&mut self) {

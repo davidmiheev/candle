@@ -83,6 +83,17 @@ impl TextGeneration {
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        // Some checkpoints ship a tokenizer.json with no BOS post-processor
+        // (gemma-4-e2b-it is one), and gemma-family models degenerate into a
+        // token copy-loop without it — the output is fluent-looking repetition
+        // rather than an error, so it is easy to misread as a precision or
+        // kernel problem. Prepend BOS when the vocab has one and the encoder
+        // did not emit it.
+        if let Some(bos) = self.tokenizer.tokenizer().token_to_id("<bos>") {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
+        }
         for &t in tokens.iter() {
             if let Some(t) = self.tokenizer.next_token(t)? {
                 print!("{t}")
@@ -147,6 +158,11 @@ struct Args {
     /// Run on CPU rather than on GPU.
     #[arg(long)]
     cpu: bool,
+
+    /// Weight dtype: f16, bf16 or f32. Defaults to bf16 on GPU; candle only
+    /// builds its bf16 CUDA kernels for sm_80+, so pass f16 on older cards.
+    #[arg(long)]
+    dtype: Option<String>,
 
     /// Enable tracing (generates a trace-timestamp.json file).
     #[arg(long)]
@@ -271,10 +287,16 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.is_cuda() {
-        DType::BF16
-    } else {
-        DType::F32
+    // candle only builds its bf16 CUDA kernels for sm_80+; on an sm_75 card
+    // (T4) the first matmul fails with "named symbol not found" rather than
+    // anything that names the real problem. --dtype f16 is the way out.
+    let dtype = match args.dtype.as_deref() {
+        Some("f16") => DType::F16,
+        Some("bf16") => DType::BF16,
+        Some("f32") => DType::F32,
+        Some(other) => anyhow::bail!("unknown dtype {other}, expected f16, bf16 or f32"),
+        None if device.is_cuda() => DType::BF16,
+        None => DType::F32,
     };
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
 
@@ -289,13 +311,18 @@ fn main() -> Result<()> {
         let model = Model::new(&config, vb)?;
         ModelKind::Multimodal(model)
     } else {
+        // A multimodal checkpoint nests the decoder under the vision and audio
+        // towers, so the same config shape is reached two different ways and
+        // the weights live at two different prefixes. Whichever the config
+        // says, load the text half from where that checkpoint actually keeps it.
+        let mut nested = false;
         let mut config: Gemma4TextConfig = match args.config_file {
             Some(config_file) => serde_json::from_slice(&std::fs::read(config_file)?)?,
             None => {
                 let config_file = repo.get("config.json")?;
-                // For text-only, try to parse the text_config sub-object
                 let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(config_file)?)?;
                 if let Some(text_cfg) = raw.get("text_config") {
+                    nested = true;
                     serde_json::from_value(text_cfg.clone())?
                 } else {
                     serde_json::from_value(raw)?
@@ -303,7 +330,11 @@ fn main() -> Result<()> {
             }
         };
         config.use_flash_attn = args.use_flash_attn;
-        let model = TextModel::new(&config, vb)?;
+        let model = if nested {
+            TextModel::new_nested(&config, vb, "language_model", None)?
+        } else {
+            TextModel::new(&config, vb)?
+        };
         ModelKind::TextOnly(model)
     };
 
