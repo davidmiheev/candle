@@ -79,4 +79,3 @@ pub fn resize_grid_f32(grid: &[f32], src: usize, dst: usize, dim: usize) -> Vec<
     }
     out
 }
-

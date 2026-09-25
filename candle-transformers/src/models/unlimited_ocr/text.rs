@@ -208,7 +208,9 @@ impl Attention {
             write_slot,
         )?;
         let scale = 1.0 / (hd as f64).sqrt();
-        let att = (q.contiguous()?.matmul(&kbuf.unsqueeze(0)?.transpose(2, 3)?.contiguous()?)?
+        let att = (q
+            .contiguous()?
+            .matmul(&kbuf.unsqueeze(0)?.transpose(2, 3)?.contiguous()?)?
             * scale)?; // [1, h, 1, cap]
         let att = att
             .to_dtype(DType::F32)?
@@ -259,17 +261,23 @@ impl Attention {
             let offset = total - seq;
             let mask: Vec<f32> = (0..seq)
                 .flat_map(|i| {
-                    (0..total)
-                        .map(move |j| if j <= i + offset { 0.0 } else { f32::NEG_INFINITY })
+                    (0..total).map(move |j| {
+                        if j <= i + offset {
+                            0.0
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
                 })
                 .collect();
-            let mask = Tensor::from_vec(mask, (1, 1, seq, total), att.device())?
-                .to_dtype(att.dtype())?;
+            let mask =
+                Tensor::from_vec(mask, (1, 1, seq, total), att.device())?.to_dtype(att.dtype())?;
             att.broadcast_add(&mask)?
         } else {
             att
         };
-        let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
+        let att =
+            candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
         let out = att.matmul(&v)?;
         out.transpose(1, 2)?
             .reshape((b, seq, self.n_heads * hd))?
@@ -317,7 +325,11 @@ impl MoE {
         let h = cfg.hidden_size;
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         for i in 0..cfg.n_routed_experts {
-            experts.push(Mlp::new(h, cfg.moe_intermediate_size, vb.pp("experts").pp(i))?);
+            experts.push(Mlp::new(
+                h,
+                cfg.moe_intermediate_size,
+                vb.pp("experts").pp(i),
+            )?);
         }
         Ok(Self {
             gate_w: vb
@@ -352,12 +364,7 @@ impl MoE {
             let mut idx: Vec<usize> = (0..n_e).collect();
             // Descending by score; ties resolve to the LOWEST index, matching
             // torch.topk's first-occurrence semantics.
-            idx.sort_by(|&a, &b| {
-                row[b]
-                    .partial_cmp(&row[a])
-                    .unwrap()
-                    .then(a.cmp(&b))
-            });
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
             for &e in idx.iter().take(self.top_k) {
                 routes[e].push((t, row[e]));
             }
@@ -411,7 +418,11 @@ impl DecoderLayer {
         let ffn = if layer_idx >= cfg.first_k_dense_replace {
             FeedForward::Moe(MoE::new(cfg, vb.pp("mlp"))?)
         } else {
-            FeedForward::Dense(Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?)
+            FeedForward::Dense(Mlp::new(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                vb.pp("mlp"),
+            )?)
         };
         Ok(Self {
             self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
@@ -435,7 +446,9 @@ impl DecoderLayer {
             .self_attn
             .forward(&self.input_layernorm.forward(x)?, rotary, pos)?;
         let x = (residual + h)?;
-        let h = self.ffn.forward(&self.post_attention_layernorm.forward(&x)?)?;
+        let h = self
+            .ffn
+            .forward(&self.post_attention_layernorm.forward(&x)?)?;
         x + h
     }
 }
@@ -544,7 +557,11 @@ impl TextModel {
             .as_mut()
             .ok_or_else(|| candle::Error::Msg("rswa not enabled".into()))?;
         if n + ctx.window > ctx.cap {
-            candle::bail!("prefill {n} + window {} exceeds capacity {}", ctx.window, ctx.cap);
+            candle::bail!(
+                "prefill {n} + window {} exceeds capacity {}",
+                ctx.window,
+                ctx.cap
+            );
         }
         ctx.prefill_len = n;
         ctx.dec_steps = 0;
@@ -582,7 +599,9 @@ impl TextModel {
                 &ctx.mask,
             )?;
             let xr = (&residual + h)?;
-            let f = layer.ffn.forward(&layer.post_attention_layernorm.forward(&xr)?)?;
+            let f = layer
+                .ffn
+                .forward(&layer.post_attention_layernorm.forward(&xr)?)?;
             x = (xr + f)?;
         }
         let x = self.norm.forward(&x)?;

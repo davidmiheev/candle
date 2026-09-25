@@ -56,8 +56,8 @@ impl NoTpBlock {
         let v = qkv.i((.., .., 2, .., ..))?.transpose(1, 2)?.contiguous()?;
         let scale = (self.head_dim as f64).powf(-0.5);
         let att = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-            .to_dtype(q.dtype())?;
+        let att =
+            candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
         let out = att.matmul(&v)?; // [b, heads, seq, hd]
         out.transpose(1, 2)?
             .reshape((b, seq, hidden))?
@@ -66,7 +66,9 @@ impl NoTpBlock {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = (x + self.attn(&self.ln1.forward(x)?)?)?;
-        let m = self.fc2.forward(&quick_gelu(&self.fc1.forward(&self.ln2.forward(&h)?)?)?)?;
+        let m = self
+            .fc2
+            .forward(&quick_gelu(&self.fc1.forward(&self.ln2.forward(&h)?)?)?)?;
         h + m
     }
 }
@@ -107,9 +109,7 @@ impl ClipTower {
     fn forward(&self, patch_embeds: &Tensor) -> Result<Tensor> {
         let (b, c, gh, gw) = patch_embeds.dims4()?;
         let seq = gh * gw;
-        let pe = patch_embeds
-            .reshape((b, c, seq))?
-            .transpose(1, 2)?; // [b, seq, c]
+        let pe = patch_embeds.reshape((b, c, seq))?.transpose(1, 2)?; // [b, seq, c]
         let cls = self
             .class_embedding
             .reshape((1, 1, c))?
@@ -117,8 +117,7 @@ impl ClipTower {
             .to_dtype(pe.dtype())?;
         let x = Tensor::cat(&[cls, pe], 1)?;
         let pos_native = self.position_embedding.reshape((1, (), c))?;
-        let pos = interp_pos_with_cls(&pos_native, gh)?
-            .to_dtype(x.dtype())?;
+        let pos = interp_pos_with_cls(&pos_native, gh)?.to_dtype(x.dtype())?;
         let x = x.broadcast_add(&pos)?;
         let mut x = self.pre_ln.forward(&x)?;
         for blk in self.blocks.iter() {
@@ -245,7 +244,7 @@ impl DeepEncoder {
         let local = Tensor::cat(&feats, 0)?; // [n, 100, d]
         let g2 = local.dim(1)?;
         let gsz = (g2 as f64).sqrt() as usize; // 10
-        // (hc, wc, g, g, d) -> permute(0,2,1,3,4) -> (hc*g, wc*g, d)
+                                               // (hc, wc, g, g, d) -> permute(0,2,1,3,4) -> (hc*g, wc*g, d)
         let mosaic = local
             .reshape((hc, wc, gsz, gsz, d))?
             .permute((0, 2, 1, 3, 4))?
@@ -283,7 +282,6 @@ impl DeepEncoder {
 }
 
 use candle::D::Minus1 as D_MINUS1;
-
 
 // Position-grid interpolation: shared torch-bicubic-antialias core lives in
 // models::interpolation; this wrapper handles the cls-token-carrying CLIP

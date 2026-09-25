@@ -207,8 +207,8 @@ fn get_rel_pos(q_size: usize, k_size: usize, rel_pos: &Tensor) -> Result<Tensor>
                     + table[b * dim + c] as f64 * frac) as f32;
             }
         }
-        interp_holder = Tensor::from_vec(out, (max_rel_dist, dim), dev)?
-            .to_dtype(rel_pos.dtype())?;
+        interp_holder =
+            Tensor::from_vec(out, (max_rel_dist, dim), dev)?.to_dtype(rel_pos.dtype())?;
         &interp_holder
     } else {
         rel_pos
@@ -506,15 +506,10 @@ impl Module for ImageEncoderViT {
                     let dim = pos_embed.dim(3)?;
                     let f = pos_embed.to_dtype(candle::DType::F32)?;
                     let body: Vec<f32> = f.flatten_all()?.to_vec1()?;
-                    let resized = crate::models::interpolation::resize_grid_f32(
-                        &body, src, tgt, dim,
-                    );
-                    let p = Tensor::from_vec(
-                        resized,
-                        (1, tgt, tgt, dim),
-                        pos_embed.device(),
-                    )?
-                    .to_dtype(pos_embed.dtype())?;
+                    let resized =
+                        crate::models::interpolation::resize_grid_f32(&body, src, tgt, dim);
+                    let p = Tensor::from_vec(resized, (1, tgt, tgt, dim), pos_embed.device())?
+                        .to_dtype(pos_embed.dtype())?;
                     xs.broadcast_add(&p)?
                 }
             }
