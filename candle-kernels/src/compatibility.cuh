@@ -7,7 +7,9 @@
 
 // FIXME: the minimum compute capabilities are just guesses since the table is not specific enough
 
-#if __CUDA_ARCH__ < 800
+// CUDA 12.0+ defines these itself for __CUDA_ARCH__ >= 530, so redefining
+// them here makes nvcc fail with "function has already been defined".
+#if __CUDA_ARCH__ < 800 && CUDART_VERSION < 12000
 __device__ __forceinline__ __half __hmax_nan(__half a, __half b) {
     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmax(a, b));
 }
