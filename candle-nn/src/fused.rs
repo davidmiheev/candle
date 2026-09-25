@@ -220,9 +220,11 @@ pub fn fused_add_rmsnorm(
     #[cfg(feature = "cuda")]
     if x.device().is_cuda() && matches!(x.dtype(), DType::F32 | DType::BF16) {
         let op = cuda::FusedAddRmsNorm { eps, plus_one };
-        let both = x
-            .contiguous()?
-            .apply_op3_no_bwd(&residual.contiguous()?, &weight.contiguous()?, &op)?;
+        let both = x.contiguous()?.apply_op3_no_bwd(
+            &residual.contiguous()?,
+            &weight.contiguous()?,
+            &op,
+        )?;
         let sum = both.get(0)?;
         let normed = both.get(1)?;
         return Ok((sum, normed));
@@ -270,9 +272,7 @@ pub mod static_decode {
     use candle::cuda_backend::{kernels, CudaStorageSlice, WrapErr};
     use candle::{DType, Result, Storage, Tensor};
 
-    fn cuda_parts<'a>(
-        t: &'a Tensor,
-    ) -> Result<(std::sync::RwLockReadGuard<'a, Storage>, usize)> {
+    fn cuda_parts<'a>(t: &'a Tensor) -> Result<(std::sync::RwLockReadGuard<'a, Storage>, usize)> {
         let (s, l) = t.storage_and_layout();
         let off = l.start_offset();
         Ok((s, off))
@@ -451,7 +451,11 @@ pub mod static_decode {
         // Launch geometry per candle's dmmv path: block (32, 4), rows/4 blocks.
         let block_y = 4u32;
         let grid = ((nrows as u32).div_ceil(block_y), 1, 1);
-        let cfg = LaunchConfig { grid_dim: grid, block_dim: (32, block_y, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: grid,
+            block_dim: (32, block_y, 1),
+            shared_mem_bytes: 0,
+        };
         let bp = buf.as_cuda_slice::<u8>()?;
         let bp = bp.slice(buf_byte_offset..);
         let (ys, yo) = cuda_parts(y_f32)?;
@@ -487,7 +491,11 @@ pub mod static_decode {
         let total = (k * rows_per_expert * row_bytes) as u32;
         let threads = 256u32;
         let blocks = (total / 16 / threads + 1).min(1024);
-        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let (is, io) = cuda_parts(idx)?;
         let sp = src.as_cuda_slice::<u8>()?;
         let dp = dst.as_cuda_slice::<u8>()?;
@@ -511,7 +519,11 @@ pub mod static_decode {
         let dev = cuda_dev(gu)?;
         let func = dev.get_or_load_func("moe_silu_mul_f32", &kernels::FUSED)?;
         let n = (k * inter) as u32;
-        let cfg = LaunchConfig { grid_dim: ((n / 256 + 1).min(1024), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((n / 256 + 1).min(1024), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let (gs, go) = cuda_parts(gu)?;
         let (hs, ho) = cuda_parts(h)?;
         with_slice!(gs, go, F32, gp, {
@@ -529,10 +541,20 @@ pub mod static_decode {
     }
 
     /// A5b: y[o] = sum_j w[j] * part[j, o] with device-resident weights.
-    pub fn moe_weighted_sum(part: &Tensor, w: &Tensor, y: &Tensor, hidden: usize, k: usize) -> Result<()> {
+    pub fn moe_weighted_sum(
+        part: &Tensor,
+        w: &Tensor,
+        y: &Tensor,
+        hidden: usize,
+        k: usize,
+    ) -> Result<()> {
         let dev = cuda_dev(part)?;
         let func = dev.get_or_load_func("moe_weighted_sum_f32", &kernels::FUSED)?;
-        let cfg = LaunchConfig { grid_dim: ((hidden as u32 / 256 + 1).min(1024), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: ((hidden as u32 / 256 + 1).min(1024), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let (ps, po) = cuda_parts(part)?;
         let (ws, wo) = cuda_parts(w)?;
         let (ys, yo) = cuda_parts(y)?;
@@ -561,7 +583,11 @@ pub mod static_decode {
             candle::bail!("moe_topk_gate_f32 supports n <= 256");
         }
         let func = dev.get_or_load_func("moe_topk_gate_f32", &kernels::FUSED)?;
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let (ls, lo) = cuda_parts(logits)?;
         let (is, io) = cuda_parts(idx)?;
         let (ws, wo) = cuda_parts(w)?;
@@ -689,7 +715,11 @@ pub mod static_decode {
     pub fn incr_add_u32(pos: &Tensor, delta: u32) -> Result<()> {
         let dev = cuda_dev(pos)?;
         let func = dev.get_or_load_func("incr_add_u32", &kernels::FUSED)?;
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let (ps, po) = cuda_parts(pos)?;
         with_slice!(ps, po, U32, pp, {
             let mut b = func.builder();
@@ -959,7 +989,11 @@ pub mod static_decode {
         let (kv_heads, max_seq, hd) = buf.dims3()?;
         let (h2, t, hd2) = src.dims3()?;
         if h2 != kv_heads || hd2 != hd {
-            candle::bail!("kv_write_chunk: shape mismatch {:?} vs {:?}", buf.dims(), src.dims());
+            candle::bail!(
+                "kv_write_chunk: shape mismatch {:?} vs {:?}",
+                buf.dims(),
+                src.dims()
+            );
         }
         // Rows land at (pos + r) % max_seq in-kernel: full-size buffers need
         // pos + t in range like before; ring buffers (rows < absolute
@@ -1050,48 +1084,45 @@ pub mod static_decode {
             shared_mem_bytes: smem as u32,
         };
         {
-        let (qs, qo) = cuda_parts(q)?;
-        let (ks, ko) = cuda_parts(k)?;
-        let (vs, vo) = cuda_parts(v)?;
-        let (bs, bo) = cuda_parts(beta)?;
-        let (ds, do_) = cuda_parts(decay)?;
-        let (ss, so) = cuda_parts(s)?;
-        let (os, oo) = cuda_parts(&o)?;
-        with_slice!(qs, qo, F32, qp, {
-            with_slice!(ks, ko, F32, kp, {
-                with_slice!(vs, vo, F32, vp, {
-                    with_slice!(bs, bo, F32, bp, {
-                        with_slice!(ds, do_, F32, dp, {
-                            with_slice!(ss, so, F32, sp, {
-                                with_slice!(os, oo, F32, op, {
-                                    let (ti, nki, nvi, dki, dvi) = (
-                                        t as i32,
-                                        n_k as i32,
-                                        n_v as i32,
-                                        d_k as i32,
-                                        d_v as i32,
-                                    );
-                                    let mut b = func.builder();
-                                    b.arg(&qp);
-                                    b.arg(&kp);
-                                    b.arg(&vp);
-                                    b.arg(&bp);
-                                    b.arg(&dp);
-                                    b.arg(&sp);
-                                    b.arg(&op);
-                                    b.arg(&ti);
-                                    b.arg(&nki);
-                                    b.arg(&nvi);
-                                    b.arg(&dki);
-                                    b.arg(&dvi);
-                                    unsafe { b.launch(cfg) }.w()?;
+            let (qs, qo) = cuda_parts(q)?;
+            let (ks, ko) = cuda_parts(k)?;
+            let (vs, vo) = cuda_parts(v)?;
+            let (bs, bo) = cuda_parts(beta)?;
+            let (ds, do_) = cuda_parts(decay)?;
+            let (ss, so) = cuda_parts(s)?;
+            let (os, oo) = cuda_parts(&o)?;
+            with_slice!(qs, qo, F32, qp, {
+                with_slice!(ks, ko, F32, kp, {
+                    with_slice!(vs, vo, F32, vp, {
+                        with_slice!(bs, bo, F32, bp, {
+                            with_slice!(ds, do_, F32, dp, {
+                                with_slice!(ss, so, F32, sp, {
+                                    with_slice!(os, oo, F32, op, {
+                                        let (ti, nki, nvi, dki, dvi) = (
+                                            t as i32, n_k as i32, n_v as i32, d_k as i32,
+                                            d_v as i32,
+                                        );
+                                        let mut b = func.builder();
+                                        b.arg(&qp);
+                                        b.arg(&kp);
+                                        b.arg(&vp);
+                                        b.arg(&bp);
+                                        b.arg(&dp);
+                                        b.arg(&sp);
+                                        b.arg(&op);
+                                        b.arg(&ti);
+                                        b.arg(&nki);
+                                        b.arg(&nvi);
+                                        b.arg(&dki);
+                                        b.arg(&dvi);
+                                        unsafe { b.launch(cfg) }.w()?;
+                                    });
                                 });
                             });
                         });
                     });
                 });
             });
-        });
         }
         Ok(o)
     }
