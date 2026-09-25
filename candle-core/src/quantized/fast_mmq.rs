@@ -307,8 +307,7 @@ pub fn try_fwd(
     let dev = qstorage.device();
     // Q2K and Q6K MMQ kernels miscompile when JIT'd onto newer majors
     // (observed NaNs on sm_120 even with f32 inputs); fall back.
-    if matches!(w_dtype, GgmlDType::Q2K | GgmlDType::Q6K)
-        && super::fast_mmvq::device_major(dev) > 9
+    if matches!(w_dtype, GgmlDType::Q2K | GgmlDType::Q6K) && super::fast_mmvq::device_major(dev) > 9
     {
         return Ok(None);
     }

@@ -64,9 +64,7 @@ fn half_kernels_trusted(dev: &CudaDevice) -> bool {
     let v = match std::env::var("CANDLE_MMVQ_HALF").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
-        _ => {
-            device_major(dev) <= 9
-        }
+        _ => device_major(dev) <= 9,
     };
     map.insert(dev.id(), v);
     v
