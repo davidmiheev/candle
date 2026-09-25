@@ -37,6 +37,41 @@ fn supports(dtype: GgmlDType) -> bool {
 
 const MMVQ_MAX_BATCH: usize = 8;
 
+/// The GGUF bf16/f16 kernel instantiations miscompile when the driver JIT
+/// translates their PTX onto a newer GPU architecture than they were built
+/// for (observed: compute_89 PTX -> sm_120/Blackwell produces NaNs in the
+/// bf16 mmvq path). Trust the half-precision kernels only on devices whose
+/// compute-capability major is at or below the Ada/Hopper generation the
+/// kernels are compiled for; on newer majors fall back to the f32 kernels
+/// (inputs are converted, outputs converted back). Override with
+/// CANDLE_MMVQ_HALF=1 (force native) / CANDLE_MMVQ_HALF=0 (force fallback).
+pub(crate) fn device_major(dev: &CudaDevice) -> i32 {
+    dev.cuda_stream()
+        .context()
+        .attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+        .unwrap_or(8)
+}
+
+fn half_kernels_trusted(dev: &CudaDevice) -> bool {
+    static TRUSTED: OnceLock<Mutex<HashMap<DeviceId, bool>>> = OnceLock::new();
+    let map = TRUSTED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(v) = map.get(&dev.id()) {
+        return *v;
+    }
+    let v = match std::env::var("CANDLE_MMVQ_HALF").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => {
+            device_major(dev) <= 9
+        }
+    };
+    map.insert(dev.id(), v);
+    v
+}
+
 // ---------------------------------------------------------------------------
 // Per-device Q8_1 scratch workspace (grows-only, reused across calls).
 // ---------------------------------------------------------------------------
@@ -196,6 +231,11 @@ pub fn try_fwd(
     };
 
     let dev = qstorage.device();
+    // Q2K mmvq kernels produce NaNs when JIT'd onto newer majors (sm_120+),
+    // even with f32 inputs; let those fall through to the dequantize path.
+    if matches!(w_dtype, GgmlDType::Q2K) && device_major(dev) > 9 {
+        return Ok(None);
+    }
     let stream_ptr = dev.cuda_stream().cu_stream() as *mut std::ffi::c_void;
 
     let k_padded = pad(k, MATRIX_ROW_PADDING);
@@ -214,6 +254,50 @@ pub fn try_fwd(
     out_shape.push(nrows);
 
     let stream = dev.cuda_stream();
+
+    // On architectures where the half-precision kernel instantiations are
+    // unreliable, convert the (tiny) activation vector to f32, run the f32
+    // kernels, and convert the output back.
+    if matches!(input_dtype, DType::BF16 | DType::F16) && !half_kernels_trusted(dev) {
+        let cast_layout =
+            crate::Layout::contiguous_with_offset(rhs_l.shape(), rhs_l.start_offset());
+        let rhs_f32 = rhs.to_dtype(&cast_layout, DType::F32)?;
+        let rhs_slice = rhs_f32.as_cuda_slice::<f32>()?;
+        let rhs_slice = rhs_slice.slice(0..(b_size * k));
+        let out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+
+        let rhs_ptr = rhs_slice.device_ptr(&stream).0 as *const std::ffi::c_void;
+        let out_ptr = out.device_ptr(&stream).0 as *mut std::ffi::c_void;
+
+        unsafe {
+            ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                rhs_ptr,
+                scratch_ptr,
+                k as i32,
+                k_padded as i32,
+                b_size as i32,
+                stream_ptr,
+            );
+            let launcher = plain_launcher_f32(w_dtype).unwrap();
+            launcher(
+                weight_ptr,
+                scratch_ptr as *const std::ffi::c_void,
+                out_ptr,
+                k as i32,
+                nrows as i32,
+                stride_col_y,
+                stride_col_dst,
+                b_size as i32,
+                stream_ptr,
+            );
+        }
+
+        let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        let out_shape: Shape = out_shape.into();
+        let out_layout = crate::Layout::contiguous(&out_shape);
+        let out_storage = out_storage.to_dtype(&out_layout, input_dtype)?;
+        return Ok(Some((out_storage, out_shape)));
+    }
 
     match input_dtype {
         DType::BF16 => {
