@@ -23,9 +23,9 @@ use super::config::TextConfig;
 #[derive(Debug, Clone)]
 pub struct RotaryEmbedding {
     /// Precomputed cos values for all positions: [max_seq_len, head_dim/2]
-    cos: Tensor,
+    pub(crate) cos: Tensor,
     /// Precomputed sin values for all positions: [max_seq_len, head_dim/2]
-    sin: Tensor,
+    pub(crate) sin: Tensor,
     /// M-RoPE section sizes: [temporal, height, width]
     mrope_section: Vec<usize>,
     head_dim: usize,
@@ -733,9 +733,17 @@ struct Attention {
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: candle_nn::kv_cache::KvCache,
     softmax_scale: f64,
+    /// Preallocated [kv_heads, max_seq, head_dim] K/V for the shape-static
+    /// (graph-replayable) decode path. Filled by migrate_kv_to_static after
+    /// dynamic prefill; written in place per token by forward_static.
+    static_kv: Option<(Tensor, Tensor)>,
 }
+
+/// Initial KV-cache capacity (seq dim). The cache grows on demand, so this is
+/// a soft sizing hint covering typical image prefill + generation.
+const KV_CACHE_INIT_LEN: usize = 4096;
 
 impl Attention {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
@@ -780,8 +788,9 @@ impl Attention {
             num_kv_groups,
             head_dim,
             rotary_emb,
-            kv_cache: None,
+            kv_cache: candle_nn::kv_cache::KvCache::new(2, KV_CACHE_INIT_LEN),
             softmax_scale: 1.0 / (head_dim as f64).sqrt(),
+            static_kv: None,
         })
     }
 
@@ -835,32 +844,40 @@ impl Attention {
         b_sz: usize,
         q_len: usize,
     ) -> Result<Tensor> {
-        // KV cache handling
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // Append only the new K/V into the preallocated cache; the returned
+        // views cover the whole sequence. This replaces the previous
+        // full-sequence `Tensor::cat` per decode step.
+        let (key_states, value_states) = self
+            .kv_cache
+            .append(&key_states.contiguous()?, &value_states.contiguous()?)?;
+        let kv_len = key_states.dim(2)?;
 
-        // Repeat KV heads for GQA (matches PyTorch's repeat_kv)
-        let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
-        let value_states =
-            crate::utils::repeat_kv(value_states, self.num_kv_groups)?.contiguous()?;
+        // GQA via broadcast: fold the query-head groups into the row dim so
+        // K/V are never materialized `num_kv_groups` times (the previous
+        // `repeat_kv(..).contiguous()` copied an 8x-expanded K/V of the whole
+        // sequence on every decode step).
+        let groups = self.num_kv_groups;
+        let query_states = query_states.contiguous()?.reshape((
+            b_sz,
+            self.num_kv_heads,
+            groups * q_len,
+            self.head_dim,
+        ))?;
 
         // Compute attention (matches eager_attention_forward_ernie)
         let attn_output = {
-            // attn_weights = query @ key^T * scaling
+            // attn_weights = query @ key^T * scaling — [b, kv, g*q, s]
             let attn_weights =
                 (query_states.matmul(&key_states.transpose(2, 3)?)? * self.softmax_scale)?;
 
-            // Apply causal mask
+            // Apply causal mask ([b, 1, q, s]) — broadcast over kv-heads and
+            // groups through a 5-D view.
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(mask)?,
+                Some(mask) => attn_weights
+                    .reshape((b_sz, self.num_kv_heads, groups, q_len, kv_len))?
+                    .broadcast_add(&mask.unsqueeze(1)?)?
+                    .reshape((b_sz, self.num_kv_heads, groups * q_len, kv_len))?,
             };
             // Softmax in F32 for stability (matches PyTorch's softmax(..., dtype=torch.float32).to(query.dtype))
             let original_dtype = attn_weights.dtype();
@@ -871,12 +888,13 @@ impl Attention {
             } else {
                 candle_nn::ops::softmax_last_dim(&attn_weights)?
             };
-            // attn_output = attn_weights @ value
+            // attn_output = attn_weights @ value — [b, kv, g*q, d]
             attn_weights.matmul(&value_states)?
         };
 
-        // attn_output.transpose(1, 2).contiguous().reshape(...)
+        // [b, kv, g*q, d] -> [b, H, q, d] -> [b, q, H*d]
         attn_output
+            .reshape((b_sz, self.num_heads, q_len, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
@@ -989,8 +1007,102 @@ impl Attention {
         Ok((output, tensors))
     }
 
+    fn enable_static(&mut self, max_seq: usize, dtype: DType, dev: &Device) -> Result<()> {
+        if self.static_kv.is_none() {
+            let shape = (self.num_kv_heads, max_seq, self.head_dim);
+            self.static_kv = Some((
+                Tensor::zeros(shape, dtype, dev)?,
+                Tensor::zeros(shape, dtype, dev)?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Copy the dynamic KV cache contents (post-prefill) into the static
+    /// buffers at rows [0, seq). Returns the migrated length.
+    fn migrate_kv_to_static(&mut self) -> Result<usize> {
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        let k = self.kv_cache.k()?;
+        let v = self.kv_cache.v()?;
+        let (k, v) = match (k, v) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Ok(0),
+        };
+        let (_b, kvh, seq, hd) = k.dims4()?;
+        let kc = k.reshape((kvh, seq, hd))?.contiguous()?;
+        let vc = v.reshape((kvh, seq, hd))?.contiguous()?;
+        candle_nn::fused::static_decode::kv_write_chunk(kbuf, &kc, 0)?;
+        candle_nn::fused::static_decode::kv_write_chunk(vbuf, &vc, 0)?;
+        Ok(seq)
+    }
+
+    /// One-token attention over the full static buffer, indexed by the device
+    /// position. All shapes/addresses fixed: replayable inside a CUDA graph.
+    /// M-RoPE note: at text-decode positions all three position components
+    /// are equal, so M-RoPE collapses to standard RoPE at that row — applied
+    /// via a device-side row gather from the precomputed tables.
+    fn forward_static(&mut self, xs: &Tensor, pos: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        debug_assert_eq!((b_sz, q_len), (1, 1));
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .clone();
+        let max_seq = kbuf.dim(1)?;
+
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((1, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(xs)?
+            .reshape((1, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(xs)?
+            .reshape((1, 1, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let cos_p = self.rotary_emb.cos.index_select(pos, 0)?; // [1, hd/2]
+        let sin_p = self.rotary_emb.sin.index_select(pos, 0)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos_p, &sin_p)?;
+        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos_p, &sin_p)?;
+
+        candle_nn::fused::static_decode::kv_write(
+            &kbuf,
+            &vbuf,
+            &k.reshape((self.num_kv_heads, 1, self.head_dim))?
+                .contiguous()?,
+            &v.reshape((self.num_kv_heads, 1, self.head_dim))?
+                .contiguous()?,
+            pos,
+        )?;
+
+        // Broadcast-GQA over the full buffer (their C2 trick, static shapes).
+        let groups = self.num_kv_groups;
+        let qg = q.reshape((1, self.num_kv_heads, groups, self.head_dim))?; // q_len folded
+        let kb = kbuf.unsqueeze(0)?; // [1, kv, max, hd]
+        let vb = vbuf.unsqueeze(0)?;
+        let attn = (qg.matmul(&kb.transpose(2, 3)?.contiguous()?)? * self.softmax_scale)?; // [1, kv, g, max]
+        let attn = attn.broadcast_add(&mask.reshape((1, 1, 1, max_seq))?)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&vb.contiguous()?)?; // [1, kv, g, hd]
+        out.reshape((1, self.num_heads, 1, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((1, 1, self.num_heads * self.head_dim))?
+            .apply(&self.o_proj)
+    }
+
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
     }
 }
 
@@ -1089,6 +1201,18 @@ impl DecoderLayer {
         Ok((output, tensors))
     }
 
+    fn forward_static(&mut self, xs: &Tensor, pos: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward_static(&xs, pos, mask)?;
+        let xs = (xs + residual)?;
+        let residual = &xs;
+        let xs = self
+            .mlp
+            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
+        residual + xs
+    }
+
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
@@ -1103,6 +1227,27 @@ pub struct TextModel {
     pub dtype: DType,
     pub hidden_size: usize,
     device: Device,
+    static_ctx: Option<OcrStaticCtx>,
+}
+
+/// Device-resident state for the shape-static decode path.
+pub struct OcrStaticCtx {
+    pub pos: Tensor,  // u32 [1]
+    pub mask: Tensor, // f32-additive mask row [max_seq] in model dtype
+    pub max_seq: usize,
+}
+
+impl OcrStaticCtx {
+    fn new(max_seq: usize, dtype: DType, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            pos: Tensor::zeros(1, DType::U32, dev)?,
+            mask: Tensor::zeros(max_seq, dtype, dev)?,
+            max_seq,
+        })
+    }
+    fn refresh_mask(&self) -> Result<()> {
+        candle_nn::fused::static_decode::mask_from_pos(&self.mask, &self.pos, 0)
+    }
 }
 
 impl TextModel {
@@ -1136,6 +1281,7 @@ impl TextModel {
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
             device: vb.device().clone(),
+            static_ctx: None,
         })
     }
 
@@ -1189,11 +1335,71 @@ impl TextModel {
 
         xs = xs.apply(&self.norm)?;
 
-        // Only compute logits for last token
-        self.lm_head
-            .forward(&xs)?
-            .i((.., seq_len - 1, ..))?
-            .contiguous()
+        // Only compute logits for the last token — narrow BEFORE the lm_head so
+        // prefill doesn't pay a [seq_len, vocab] projection for rows it throws
+        // away (vocab is ~100k; on a ~1k-token image prefill that's ~100 GFLOP).
+        let last = xs.i((.., seq_len - 1, ..))?.contiguous()?;
+        self.lm_head.forward(&last)
+    }
+
+    /// Enable the shape-static decode path with a fixed [max_seq] budget.
+    pub fn enable_static_decode(&mut self, max_seq: usize) -> Result<()> {
+        if self.static_ctx.is_none() {
+            self.static_ctx = Some(OcrStaticCtx::new(max_seq, self.dtype, &self.device)?);
+        }
+        let (dtype, dev) = (self.dtype, self.device.clone());
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.enable_static(max_seq, dtype, &dev)?;
+        }
+        Ok(())
+    }
+
+    pub fn static_enabled(&self) -> bool {
+        self.static_ctx.is_some()
+    }
+
+    /// After dynamic prefill: copy every layer's KV into the static buffers
+    /// and set the device position to the prefill length. Returns that length.
+    pub fn migrate_prefill_to_static(&mut self) -> Result<usize> {
+        let mut n = 0usize;
+        for layer in self.layers.iter_mut() {
+            n = layer.self_attn.migrate_kv_to_static()?;
+        }
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        if n >= ctx.max_seq {
+            candle::bail!("prefill length {n} exceeds static max_seq {}", ctx.max_seq);
+        }
+        candle_nn::fused::static_decode::write_u32(&ctx.pos, n as u32)?;
+        Ok(n)
+    }
+
+    /// One graph-replayable decode step: [1,1] token ids -> [1, vocab] logits.
+    pub fn forward_static(&mut self, input_ids: &Tensor) -> Result<Tensor> {
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        ctx.refresh_mask()?;
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward_static(&xs, &ctx.pos, &ctx.mask)?;
+        }
+        let xs = xs.apply(&self.norm)?;
+        let last = xs.i((.., 0, ..))?.contiguous()?;
+        let logits = self.lm_head.forward(&last)?;
+        candle_nn::fused::static_decode::incr_u32(&ctx.pos)?;
+        Ok(logits)
+    }
+
+    /// Rewind the static position (between requests; never inside a graph).
+    pub fn reset_static(&mut self) -> Result<()> {
+        match self.static_ctx.as_ref() {
+            Some(ctx) => candle_nn::fused::static_decode::write_u32(&ctx.pos, 0),
+            None => Ok(()),
+        }
     }
 
     /// Clear all KV caches.
@@ -1201,6 +1407,7 @@ impl TextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
+        let _ = self.reset_static();
     }
 
     /// Forward pass with M-RoPE and tensor export for debugging.
