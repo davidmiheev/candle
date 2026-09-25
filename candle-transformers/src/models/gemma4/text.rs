@@ -521,7 +521,7 @@ fn moe_quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
         requested,
         GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
     );
-    if needs_256 && k % 256 != 0 {
+    if needs_256 && !k.is_multiple_of(256) {
         GgmlDType::Q8_0
     } else {
         requested
@@ -2798,6 +2798,7 @@ mod tests {
 
     /// Dense tiny config (no MoE) with a k_eq_v global layer — the batch-4
     /// chunk-machinery parity surface.
+    #[cfg(feature = "cuda")] // only the CUDA parity test builds this model
     fn dense_test_config() -> Gemma4TextConfig {
         serde_json::from_str(
             r#"{
@@ -2826,6 +2827,7 @@ mod tests {
 
     /// Deterministic non-zero weights: learn names/shapes via a VarMap build,
     /// then rebuild a from_tensors VarBuilder (norms near 1, rest small).
+    #[cfg(feature = "cuda")] // only the CUDA parity test builds this model
     fn dense_test_weights(
         cfg: &Gemma4TextConfig,
         dev: &Device,
