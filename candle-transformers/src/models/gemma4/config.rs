@@ -47,6 +47,18 @@ fn default_use_flash_attn() -> bool {
     false
 }
 
+/// serde(default) alone rejects explicit `null` (present in real gemma-4
+/// configs, e.g. `"num_experts": null` on non-MoE checkpoints) — treat null
+/// as the default value.
+fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 // ── Rope parameters ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -96,6 +108,16 @@ pub struct Gemma4TextConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub use_double_wide_mlp: bool,
+    #[serde(default)]
+    pub num_kv_shared_layers: usize,
+    /// Per-Layer Embeddings (PLE): auxiliary per-layer input signal
+    /// (e.g. gemma-4-E2B-it). 0 disables the feature.
+    #[serde(default)]
+    pub hidden_size_per_layer_input: usize,
+    #[serde(default)]
+    pub vocab_size_per_layer_input: usize,
     #[serde(
         default = "default_sliding_window_pattern",
         alias = "_sliding_window_pattern"
@@ -109,6 +131,20 @@ pub struct Gemma4TextConfig {
     pub use_bidirectional_attention: Option<String>,
     #[serde(default = "default_use_flash_attn")]
     pub use_flash_attn: bool,
+    /// MoE block (e.g. gemma-4-26B-A4B-it): each layer adds a routed
+    /// mixture-of-experts branch alongside the dense MLP.
+    #[serde(default, deserialize_with = "null_default")]
+    pub enable_moe_block: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub num_experts: usize,
+    #[serde(default, deserialize_with = "null_default")]
+    pub top_k_experts: usize,
+    #[serde(default, deserialize_with = "null_default")]
+    pub moe_intermediate_size: usize,
+    /// Global (full-attention) layers share the K projection for V — the
+    /// checkpoint has no v_proj on those layers (e.g. gemma-4-26B-A4B-it).
+    #[serde(default, deserialize_with = "null_default")]
+    pub attention_k_eq_v: bool,
 }
 
 impl Gemma4TextConfig {
@@ -134,6 +170,16 @@ impl Gemma4TextConfig {
             .and_then(|rp| rp.sliding_attention.as_ref())
             .and_then(|sa| sa.rope_theta)
             .unwrap_or(10000.0)
+    }
+
+    /// Base frequency for global (full-attention) layers: rope_parameters
+    /// takes precedence over the legacy top-level rope_theta.
+    pub fn rope_global_base_freq(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|rp| rp.full_attention.as_ref())
+            .and_then(|fa| fa.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 
     pub fn is_sliding(&self, layer_idx: usize) -> bool {
