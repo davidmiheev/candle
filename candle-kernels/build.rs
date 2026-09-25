@@ -33,11 +33,8 @@ fn main() -> Result<()> {
     // all-None and behavior is unchanged.
     println!("cargo::rerun-if-env-changed=CANDLE_CUBIN");
     let images_path = out_dir.join("images.rs");
-    let excluded = |name: &str| {
-        name.starts_with("moe_")
-            || name.starts_with("mmq_")
-            || name == "mmvq_gguf"
-    };
+    let excluded =
+        |name: &str| name.starts_with("moe_") || name.starts_with("mmq_") || name == "mmvq_gguf";
     let mut stems: Vec<String> = std::fs::read_dir("src")
         .unwrap()
         .filter_map(|e| {

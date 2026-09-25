@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub mod cudnn;
 mod device;
 mod error;
-mod utils;
 pub mod graph;
+mod utils;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
@@ -2754,8 +2754,18 @@ unsafe fn gemm_strided_batched_bf16(
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
     if std::env::var("CANDLE_GEMM_DEBUG").is_ok() {
-        eprintln!("[gemm bf16] batch={} m={} n={} k={} lda={} ldb={} ldc={} sa={} sb={}",
-            cfg.batch_size, cfg.gemm.m, cfg.gemm.n, cfg.gemm.k, cfg.gemm.lda, cfg.gemm.ldb, cfg.gemm.ldc, cfg.stride_a, cfg.stride_b);
+        eprintln!(
+            "[gemm bf16] batch={} m={} n={} k={} lda={} ldb={} ldc={} sa={} sb={}",
+            cfg.batch_size,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            cfg.gemm.lda,
+            cfg.gemm.ldb,
+            cfg.gemm.ldc,
+            cfg.stride_a,
+            cfg.stride_b
+        );
     }
     if cfg.batch_size == 1 {
         // Plain (non-batched) GEMM: functionally identical for batch 1 and,
