@@ -548,12 +548,16 @@ impl Proj {
             Some(dtype) => {
                 let dtype = quant_dtype_for(in_dim, dtype);
                 let device = vb.device().clone();
-                let weight = vb.get((out_dim, in_dim), "weight")?;
-                // Quantize via the CPU: an f32 copy of every expert would not
-                // fit on the card this exists to fit the model onto.
+                // Read the weight straight onto the CPU and quantize it there:
+                // staging each float weight on the GPU first ran a 16 GB T4
+                // out of memory partway through loading, although the
+                // quantized model is about 9 GB.
+                let weight = vb
+                    .clone()
+                    .set_device(Device::Cpu)
+                    .get((out_dim, in_dim), "weight")?;
                 let weight = if device.is_cuda() {
-                    let cpu = weight.to_device(&Device::Cpu)?;
-                    QTensor::quantize_onto(&cpu, dtype, &device)?
+                    QTensor::quantize_onto(&weight, dtype, &device)?
                 } else {
                     QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?
                 };
