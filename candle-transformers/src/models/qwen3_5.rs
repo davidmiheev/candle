@@ -306,10 +306,7 @@ impl FullAttention {
         let qg = self.q_proj.forward(x)?;
         let (q, gate) = if self.gated {
             let qg = qg.reshape((1, 1, self.n_heads, 2, hd))?;
-            (
-                qg.i((.., .., .., 0, ..))?,
-                Some(qg.i((.., .., .., 1, ..))?),
-            )
+            (qg.i((.., .., .., 0, ..))?, Some(qg.i((.., .., .., 1, ..))?))
         } else {
             (qg.reshape((1, 1, self.n_heads, hd))?, None)
         };
@@ -408,7 +405,9 @@ impl FullAttention {
         // only these layers have quadratic attention). Native GQA — no
         // repeat_kv. Gated by feature + EXP1_FLASH_PREFILL=1.
         if fresh_prefill && seq > 1 && cfg!(feature = "flash-attn") {
-            let use_fa = std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false);
+            let use_fa = std::env::var("EXP1_FLASH_PREFILL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             if use_fa {
                 let scale = 1.0 / (hd as f64).sqrt();
                 let qf = q.transpose(1, 2)?.contiguous()?; // [b, seq, heads, hd]
@@ -440,8 +439,8 @@ impl FullAttention {
         } else {
             att
         };
-        let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
-            .to_dtype(q.dtype())?;
+        let att =
+            candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
         let out = att.matmul(&vx)?; // [b, heads, seq, hd]
 
         // Elementwise output gate: attn * sigmoid(gate).
@@ -452,15 +451,19 @@ impl FullAttention {
             out
         };
 
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, seq, self.n_heads * hd))?;
+        let out = out.transpose(1, 2)?.reshape((b, seq, self.n_heads * hd))?;
         self.o_proj.forward(&out)
     }
 }
 
 #[cfg(feature = "flash-attn")]
-fn flash_attn(q: &Tensor, k: &Tensor, v: &Tensor, softmax_scale: f32, causal: bool) -> Result<Tensor> {
+fn flash_attn(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
     candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 
@@ -484,7 +487,13 @@ fn causal_mask(q_len: usize, k_len: usize, device: &Device) -> Result<Tensor> {
     let offset = k_len - q_len;
     let mask: Vec<f32> = (0..q_len)
         .flat_map(|i| {
-            (0..k_len).map(move |j| if j <= i + offset { 0.0 } else { f32::NEG_INFINITY })
+            (0..k_len).map(move |j| {
+                if j <= i + offset {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
         })
         .collect();
     Tensor::from_vec(mask, (1, 1, q_len, k_len), device)
@@ -494,14 +503,14 @@ fn causal_mask(q_len: usize, k_len: usize, device: &Device) -> Result<Tensor> {
 
 #[derive(Debug, Clone)]
 struct GatedDeltaNet {
-    in_proj_qkv: Proj, // [2*key_dim + value_dim, hidden]
-    in_proj_z: Proj,   // [value_dim, hidden]
-    in_proj_b: Linear,   // [n_v_heads, hidden]
-    in_proj_a: Linear,   // [n_v_heads, hidden]
+    in_proj_qkv: Proj,     // [2*key_dim + value_dim, hidden]
+    in_proj_z: Proj,       // [value_dim, hidden]
+    in_proj_b: Linear,     // [n_v_heads, hidden]
+    in_proj_a: Linear,     // [n_v_heads, hidden]
     conv1d_weight: Tensor, // [conv_dim, kernel] f32 (depthwise)
-    dt_bias: Tensor,     // [n_v_heads] f32
-    neg_a: Tensor,       // [n_v_heads] f32: -exp(A_log)
-    norm_weight: Tensor, // [d_v] f32
+    dt_bias: Tensor,       // [n_v_heads] f32
+    neg_a: Tensor,         // [n_v_heads] f32: -exp(A_log)
+    norm_weight: Tensor,   // [d_v] f32
     out_proj: Proj,
     n_k_heads: usize,
     n_v_heads: usize,
@@ -533,7 +542,9 @@ impl GatedDeltaNet {
             .get((conv_dim, 1, kernel), "weight")?
             .reshape((conv_dim, kernel))?
             .to_dtype(DType::F32)?;
-        let a_log = vb.get(cfg.linear_num_value_heads, "A_log")?.to_dtype(DType::F32)?;
+        let a_log = vb
+            .get(cfg.linear_num_value_heads, "A_log")?
+            .to_dtype(DType::F32)?;
         let neg_a = a_log.exp()?.neg()?;
         Ok(Self {
             in_proj_qkv: qproj(h, conv_dim, vb.pp("in_proj_qkv"))?,
@@ -541,9 +552,14 @@ impl GatedDeltaNet {
             in_proj_b: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_b"))?,
             in_proj_a: linear_no_bias(h, cfg.linear_num_value_heads, vb.pp("in_proj_a"))?,
             conv1d_weight: conv_w,
-            dt_bias: vb.get(cfg.linear_num_value_heads, "dt_bias")?.to_dtype(DType::F32)?,
+            dt_bias: vb
+                .get(cfg.linear_num_value_heads, "dt_bias")?
+                .to_dtype(DType::F32)?,
             neg_a,
-            norm_weight: vb.pp("norm").get(cfg.linear_value_head_dim, "weight")?.to_dtype(DType::F32)?,
+            norm_weight: vb
+                .pp("norm")
+                .get(cfg.linear_value_head_dim, "weight")?
+                .to_dtype(DType::F32)?,
             out_proj: qproj(value_dim, h, vb.pp("out_proj"))?,
             n_k_heads: cfg.linear_num_key_heads,
             n_v_heads: cfg.linear_num_value_heads,
@@ -636,7 +652,9 @@ impl GatedDeltaNet {
         let a_raw = self.in_proj_a.forward(&x_flat)?.to_dtype(DType::F32)?;
         let beta = candle_nn::ops::sigmoid(&b_raw)?;
         let sp = softplus(&b_cast(&a_raw, &self.dt_bias)?)?;
-        let decay = sp.broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?.exp()?;
+        let decay = sp
+            .broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?
+            .exp()?;
 
         // Roll the conv window in place: new = [old[1..], x_t].
         let qkv_t = qkv.t()?.contiguous()?; // [conv_dim, 1]
@@ -654,7 +672,9 @@ impl GatedDeltaNet {
         }
         let conved = silu_f32(&conv)?.t()?.contiguous()?; // [1, conv_dim]
 
-        let q = conved.narrow(1, 0, key_dim)?.reshape((1, self.n_k_heads, self.d_k))?;
+        let q = conved
+            .narrow(1, 0, key_dim)?
+            .reshape((1, self.n_k_heads, self.d_k))?;
         let k = conved
             .narrow(1, key_dim, key_dim)?
             .reshape((1, self.n_k_heads, self.d_k))?;
@@ -709,7 +729,9 @@ impl GatedDeltaNet {
         // β = σ(b);   decay = exp(-exp(A_log) · softplus(a + dt_bias))
         let beta = candle_nn::ops::sigmoid(&b_raw)?; // [T, n_v]
         let sp = softplus(&b_cast(&a_raw, &self.dt_bias)?)?;
-        let decay = sp.broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?.exp()?;
+        let decay = sp
+            .broadcast_mul(&self.neg_a.reshape((1, self.n_v_heads))?)?
+            .exp()?;
 
         // Causal depthwise conv over the chunk: pad with the rolling state
         // (last kernel-1 inputs of the previous chunk, zeros at start).
@@ -719,7 +741,11 @@ impl GatedDeltaNet {
             None => Tensor::zeros((conv_dim, self.conv_kernel - 1), DType::F32, &dev)?,
         };
         let padded = Tensor::cat(&[&prev, &qkv_t], 1)?; // [conv_dim, T + k - 1]
-        self.conv_state = Some(padded.narrow(1, t_len.saturating_sub(1), self.conv_kernel)?.contiguous()?);
+        self.conv_state = Some(
+            padded
+                .narrow(1, t_len.saturating_sub(1), self.conv_kernel)?
+                .contiguous()?,
+        );
         let mut conv = padded
             .narrow(1, 0, t_len)?
             .broadcast_mul(&self.conv1d_weight.narrow(1, 0, 1)?)?;
@@ -737,9 +763,10 @@ impl GatedDeltaNet {
         let k = conved
             .narrow(1, key_dim, key_dim)?
             .reshape((t_len, self.n_k_heads, self.d_k))?;
-        let v = conved
-            .narrow(1, 2 * key_dim, value_dim)?
-            .reshape((t_len, self.n_v_heads, self.d_v))?;
+        let v =
+            conved
+                .narrow(1, 2 * key_dim, value_dim)?
+                .reshape((t_len, self.n_v_heads, self.d_v))?;
         // Per-head L2 norm; q additionally scaled by d_k^-0.5 (validated
         // against the HF reference).
         let q = (l2norm_last(&q)? * (self.d_k as f64).powf(-0.5))?;
@@ -748,11 +775,7 @@ impl GatedDeltaNet {
         let st = match &self.s_state {
             Some(st) => st.clone(),
             None => {
-                let z = Tensor::zeros(
-                    (self.n_v_heads, self.d_v, self.d_k),
-                    DType::F32,
-                    &dev,
-                )?;
+                let z = Tensor::zeros((self.n_v_heads, self.d_v, self.d_k), DType::F32, &dev)?;
                 self.s_state = Some(z.clone());
                 z
             }
@@ -780,14 +803,6 @@ impl GatedDeltaNet {
     }
 }
 
-fn expand_heads(x: &Tensor, group: usize) -> Result<Tensor> {
-    if group == 1 {
-        return Ok(x.clone());
-    }
-    let (h, d) = x.dims2()?;
-    x.unsqueeze(1)?.expand((h, group, d))?.reshape((h * group, d))
-}
-
 use crate::models::gemma4::text::qcache;
 use candle::quantized::{GgmlDType, QMatMul, QTensor};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -801,9 +816,9 @@ fn quant_setting() -> &'static Mutex<Option<GgmlDType>> {
 /// q8_0 (32-wide blocks) when it is not.
 fn quant_dtype_for(in_dim: usize, requested: GgmlDType) -> GgmlDType {
     let block = requested.block_size();
-    if block > 32 && in_dim % 256 != 0 {
+    if block > 32 && !in_dim.is_multiple_of(256) {
         GgmlDType::Q8_0
-    } else if in_dim % 32 != 0 {
+    } else if !in_dim.is_multiple_of(32) {
         // Should not happen for these checkpoints; keep unquantized-safe.
         requested
     } else {
@@ -937,7 +952,12 @@ impl Mlp {
     /// Build from raw [out, in] weight slices (packed-expert checkpoints),
     /// routing each through the quantization/qcache path under classic
     /// per-expert key names so qcache files stay layout-agnostic.
-    fn from_weights(gate_w: Tensor, up_w: Tensor, down_w: Tensor, key_prefix: &str) -> Result<Self> {
+    fn from_weights(
+        gate_w: Tensor,
+        up_w: Tensor,
+        down_w: Tensor,
+        key_prefix: &str,
+    ) -> Result<Self> {
         Ok(Self {
             gate_proj: qproj_tensor(gate_w, format!("{key_prefix}.gate_proj"))?,
             up_proj: qproj_tensor(up_w, format!("{key_prefix}.up_proj"))?,
@@ -986,21 +1006,20 @@ impl Mlp {
 /// step touches is pre-allocated with stable pointers -> CUDA-graph safe.
 #[derive(Debug, Clone)]
 struct DeviceMoe {
-    gu_bytes: Tensor,   // u8 [E * 2I * row_gu] packed q4k gate_up rows
-    dn_bytes: Tensor,   // u8 [E * H * row_dn] packed q4k down rows
-    stage_gu: Tensor,   // u8 [k * 2I * row_gu]
-    stage_dn: Tensor,   // u8 [k * H * row_dn]
-    logits32: Tensor,   // f32 [E]
-    idx: Tensor,        // u32 [k]
-    w: Tensor,          // f32 [k]
-    x32: Tensor,        // f32 [H]
-    gu_out: Tensor,     // f32 [k * 2I]
-    hbuf: Tensor,       // f32 [k * I]
-    part: Tensor,       // f32 [k, H]
-    ybuf: Tensor,       // f32 [H]
+    gu_bytes: Tensor, // u8 [E * 2I * row_gu] packed q4k gate_up rows
+    dn_bytes: Tensor, // u8 [E * H * row_dn] packed q4k down rows
+    stage_gu: Tensor, // u8 [k * 2I * row_gu]
+    stage_dn: Tensor, // u8 [k * H * row_dn]
+    logits32: Tensor, // f32 [E]
+    idx: Tensor,      // u32 [k]
+    w: Tensor,        // f32 [k]
+    x32: Tensor,      // f32 [H]
+    gu_out: Tensor,   // f32 [k * 2I]
+    hbuf: Tensor,     // f32 [k * I]
+    part: Tensor,     // f32 [k, H]
+    ybuf: Tensor,     // f32 [H]
     row_gu: usize,
     row_dn: usize,
-    e: usize,
     inter: usize,
     h: usize,
 }
@@ -1015,6 +1034,7 @@ struct SparseMoe {
     top_k: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_device_moe(
     gu_bytes: &[u8],
     dn_bytes: &[u8],
@@ -1043,7 +1063,6 @@ fn build_device_moe(
         ybuf: Tensor::zeros(h, DType::F32, dev)?,
         row_gu,
         row_dn,
-        e,
         inter,
         h,
     })
@@ -1100,8 +1119,14 @@ impl SparseMoe {
                         let cpu = Device::Cpu;
                         let d_gu = quant_dtype_for(h, dtype);
                         let d_dn = quant_dtype_for(inter, dtype);
-                        anyhow_ok(h % d_gu.block_size() == 0, "gate/up rows not block-aligned")?;
-                        anyhow_ok(inter % d_dn.block_size() == 0, "down rows not block-aligned")?;
+                        anyhow_ok(
+                            h.is_multiple_of(d_gu.block_size()),
+                            "gate/up rows not block-aligned",
+                        )?;
+                        anyhow_ok(
+                            inter.is_multiple_of(d_dn.block_size()),
+                            "down rows not block-aligned",
+                        )?;
                         // gate_up: [E, 2I, H] -> flat rows, one quantize.
                         let gu_flat = gu
                             .to_device(&cpu)?
@@ -1123,112 +1148,144 @@ impl SparseMoe {
                             // buffers as raw u8 tensors; per-expert slicing
                             // happens on-device at decode (gather kernel).
                             device_moe = Some(build_device_moe(
-                                &gu_bytes, &dn_bytes, e, inter, h, row_gu, row_dn,
-                                cfg.num_experts_per_tok.unwrap_or(8), &dev,
+                                &gu_bytes,
+                                &dn_bytes,
+                                e,
+                                inter,
+                                h,
+                                row_gu,
+                                row_dn,
+                                cfg.num_experts_per_tok.unwrap_or(8),
+                                &dev,
                             )?);
                             // qcache still gets classic per-expert records so
                             // the file stays layout/mode-agnostic.
                             for i in 0..e {
                                 let g0 = i * 2 * inter * row_gu;
-                                let gate_q = qtensor_from_ggml(d_gu, &gu_bytes[g0..g0 + inter * row_gu], vec![inter, h], &Device::Cpu)?;
+                                let gate_q = qtensor_from_ggml(
+                                    d_gu,
+                                    &gu_bytes[g0..g0 + inter * row_gu],
+                                    vec![inter, h],
+                                    &Device::Cpu,
+                                )?;
                                 let u0 = g0 + inter * row_gu;
-                                let up_q = qtensor_from_ggml(d_gu, &gu_bytes[u0..u0 + inter * row_gu], vec![inter, h], &Device::Cpu)?;
+                                let up_q = qtensor_from_ggml(
+                                    d_gu,
+                                    &gu_bytes[u0..u0 + inter * row_gu],
+                                    vec![inter, h],
+                                    &Device::Cpu,
+                                )?;
                                 let dn0 = i * h * row_dn;
-                                let down_q = qtensor_from_ggml(d_dn, &dn_bytes[dn0..dn0 + h * row_dn], vec![h, inter], &Device::Cpu)?;
+                                let down_q = qtensor_from_ggml(
+                                    d_dn,
+                                    &dn_bytes[dn0..dn0 + h * row_dn],
+                                    vec![h, inter],
+                                    &Device::Cpu,
+                                )?;
                                 let kpref = format!("{kp}.{i}");
                                 qcache::put(&format!("{kpref}.gate_proj"), &Arc::new(gate_q));
                                 qcache::put(&format!("{kpref}.up_proj"), &Arc::new(up_q));
                                 qcache::put(&format!("{kpref}.down_proj"), &Arc::new(down_q));
                             }
                         } else {
-                        for i in 0..e {
-                            let g0 = i * 2 * inter * row_gu;
-                            let gate = qtensor_from_ggml(
-                                d_gu,
-                                &gu_bytes[g0..g0 + inter * row_gu],
-                                vec![inter, h],
-                                &dev,
-                            )?;
-                            let u0 = g0 + inter * row_gu;
-                            let up = qtensor_from_ggml(
-                                d_gu,
-                                &gu_bytes[u0..u0 + inter * row_gu],
-                                vec![inter, h],
-                                &dev,
-                            )?;
-                            let dn0 = i * h * row_dn;
-                            let down = qtensor_from_ggml(
-                                d_dn,
-                                &dn_bytes[dn0..dn0 + h * row_dn],
-                                vec![h, inter],
-                                &dev,
-                            )?;
-                            let (gate, up, down) = (Arc::new(gate), Arc::new(up), Arc::new(down));
-                            let kpref = format!("{kp}.{i}");
-                            qcache::put(&format!("{kpref}.gate_proj"), &gate);
-                            qcache::put(&format!("{kpref}.up_proj"), &up);
-                            qcache::put(&format!("{kpref}.down_proj"), &down);
-                            experts.push(Mlp {
-                                gate_proj: Proj::Quant(QMatMul::QTensor(gate)),
-                                up_proj: Proj::Quant(QMatMul::QTensor(up)),
-                                down_proj: Proj::Quant(QMatMul::QTensor(down)),
-                            });
-                        }
+                            for i in 0..e {
+                                let g0 = i * 2 * inter * row_gu;
+                                let gate = qtensor_from_ggml(
+                                    d_gu,
+                                    &gu_bytes[g0..g0 + inter * row_gu],
+                                    vec![inter, h],
+                                    &dev,
+                                )?;
+                                let u0 = g0 + inter * row_gu;
+                                let up = qtensor_from_ggml(
+                                    d_gu,
+                                    &gu_bytes[u0..u0 + inter * row_gu],
+                                    vec![inter, h],
+                                    &dev,
+                                )?;
+                                let dn0 = i * h * row_dn;
+                                let down = qtensor_from_ggml(
+                                    d_dn,
+                                    &dn_bytes[dn0..dn0 + h * row_dn],
+                                    vec![h, inter],
+                                    &dev,
+                                )?;
+                                let (gate, up, down) =
+                                    (Arc::new(gate), Arc::new(up), Arc::new(down));
+                                let kpref = format!("{kp}.{i}");
+                                qcache::put(&format!("{kpref}.gate_proj"), &gate);
+                                qcache::put(&format!("{kpref}.up_proj"), &up);
+                                qcache::put(&format!("{kpref}.down_proj"), &down);
+                                experts.push(Mlp {
+                                    gate_proj: Proj::Quant(QMatMul::QTensor(gate)),
+                                    up_proj: Proj::Quant(QMatMul::QTensor(up)),
+                                    down_proj: Proj::Quant(QMatMul::QTensor(down)),
+                                });
+                            }
                         }
                     }
                 }
             } else {
-            // Quantization of 3 x E slices is CPU-bound; fan it out across
-            // threads (16 vCPU pod: ~10x). Slices move to CPU first so the
-            // workers never touch the CUDA context concurrently.
-            let mut slices = Vec::with_capacity(e);
-            let cpu = Device::Cpu;
-            for i in 0..e {
-                let gui = gu.i(i)?;
-                slices.push((
-                    gui.narrow(0, 0, inter)?.contiguous()?.to_device(&cpu)?,
-                    gui.narrow(0, inter, inter)?.contiguous()?.to_device(&cpu)?,
-                    dn.i(i)?.contiguous()?.to_device(&cpu)?,
-                ));
-            }
-            let dev_main = vb.device().clone();
-            let n_workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-                .min(e.max(1));
-            let results: Vec<Result<Mlp>> = std::thread::scope(|scope| {
-                let mut handles = Vec::new();
-                let slices_ref = &slices;
-                let dev_ref = &dev_main;
-                let kp_ref: &str = &kp;
-                for w in 0..n_workers {
-                    let b = std::thread::Builder::new()
-                        .name(format!("expert-quant-{w}"))
-                        .stack_size(32 * 1024 * 1024);
-                    handles.push(b.spawn_scoped(scope, move || {
-                        let mut out = Vec::new();
-                        let mut i = w;
-                        while i < slices_ref.len() {
-                            let (g, u, d) = &slices_ref[i];
-                            out.push((
-                                i,
-                                Mlp::from_cpu_weights(g, u, d, dev_ref, &format!("{kp_ref}.{i}")),
-                            ));
-                            i += n_workers;
-                        }
-                        out
-                    }).expect("spawn expert-quant worker"));
+                // Quantization of 3 x E slices is CPU-bound; fan it out across
+                // threads (16 vCPU pod: ~10x). Slices move to CPU first so the
+                // workers never touch the CUDA context concurrently.
+                let mut slices = Vec::with_capacity(e);
+                let cpu = Device::Cpu;
+                for i in 0..e {
+                    let gui = gu.i(i)?;
+                    slices.push((
+                        gui.narrow(0, 0, inter)?.contiguous()?.to_device(&cpu)?,
+                        gui.narrow(0, inter, inter)?.contiguous()?.to_device(&cpu)?,
+                        dn.i(i)?.contiguous()?.to_device(&cpu)?,
+                    ));
                 }
-                let mut all: Vec<(usize, Result<Mlp>)> = Vec::with_capacity(e);
-                for h in handles {
-                    all.extend(h.join().expect("expert quant worker panicked"));
+                let dev_main = vb.device().clone();
+                let n_workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    .min(e.max(1));
+                let results: Vec<Result<Mlp>> = std::thread::scope(|scope| {
+                    let mut handles = Vec::new();
+                    let slices_ref = &slices;
+                    let dev_ref = &dev_main;
+                    let kp_ref: &str = &kp;
+                    for w in 0..n_workers {
+                        let b = std::thread::Builder::new()
+                            .name(format!("expert-quant-{w}"))
+                            .stack_size(32 * 1024 * 1024);
+                        handles.push(
+                            b.spawn_scoped(scope, move || {
+                                let mut out = Vec::new();
+                                let mut i = w;
+                                while i < slices_ref.len() {
+                                    let (g, u, d) = &slices_ref[i];
+                                    out.push((
+                                        i,
+                                        Mlp::from_cpu_weights(
+                                            g,
+                                            u,
+                                            d,
+                                            dev_ref,
+                                            &format!("{kp_ref}.{i}"),
+                                        ),
+                                    ));
+                                    i += n_workers;
+                                }
+                                out
+                            })
+                            .expect("spawn expert-quant worker"),
+                        );
+                    }
+                    let mut all: Vec<(usize, Result<Mlp>)> = Vec::with_capacity(e);
+                    for h in handles {
+                        all.extend(h.join().expect("expert quant worker panicked"));
+                    }
+                    all.sort_by_key(|(i, _)| *i);
+                    all.into_iter().map(|(_, r)| r).collect()
+                });
+                for r in results {
+                    experts.push(r?);
                 }
-                all.sort_by_key(|(i, _)| *i);
-                all.into_iter().map(|(_, r)| r).collect()
-            });
-            for r in results {
-                experts.push(r?);
-            }
             }
         } else {
             // Classic per-expert names (or qcache-hit loads where the raw
@@ -1274,8 +1331,15 @@ impl SparseMoe {
                 }
                 if ok {
                     device_moe = Some(build_device_moe(
-                        &gu_all, &dn_all, e, inter, h, row_gu, row_dn,
-                        cfg.num_experts_per_tok.unwrap_or(8), &dev,
+                        &gu_all,
+                        &dn_all,
+                        e,
+                        inter,
+                        h,
+                        row_gu,
+                        row_dn,
+                        cfg.num_experts_per_tok.unwrap_or(8),
+                        &dev,
                     )?);
                     assembled = true;
                 }
@@ -1286,14 +1350,13 @@ impl SparseMoe {
                 }
             }
         }
-        let (shared_expert, shared_expert_gate) =
-            match cfg.shared_expert_intermediate_size {
-                Some(si) if si > 0 => (
-                    Some(Mlp::new(h, si, vb.pp("shared_expert"))?),
-                    Some(linear_no_bias(h, 1, vb.pp("shared_expert_gate"))?),
-                ),
-                _ => (None, None),
-            };
+        let (shared_expert, shared_expert_gate) = match cfg.shared_expert_intermediate_size {
+            Some(si) if si > 0 => (
+                Some(Mlp::new(h, si, vb.pp("shared_expert"))?),
+                Some(linear_no_bias(h, 1, vb.pp("shared_expert_gate"))?),
+            ),
+            _ => (None, None),
+        };
         Ok(Self {
             gate: linear_no_bias(h, e, vb.pp("gate"))?,
             experts,
@@ -1310,7 +1373,7 @@ impl SparseMoe {
         use candle_nn::fused::static_decode as sd;
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if std::env::var("A5B_TRACE").is_ok() && c % 100 == 0 {
+        if std::env::var("A5B_TRACE").is_ok() && c.is_multiple_of(100) {
             let t = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -1329,7 +1392,9 @@ impl SparseMoe {
             let (ddst, _) = dm.stage_dn.storage_and_layout();
             use candle::Storage;
             let (gsrc, gdst, dsrc, ddst) = match (&*gsrc, &*gdst, &*dsrc, &*ddst) {
-                (Storage::Cuda(a), Storage::Cuda(b), Storage::Cuda(c), Storage::Cuda(d)) => (a, b, c, d),
+                (Storage::Cuda(a), Storage::Cuda(b), Storage::Cuda(c), Storage::Cuda(d)) => {
+                    (a, b, c, d)
+                }
                 _ => candle::bail!("device MoE requires cuda storage"),
             };
             sd::moe_gather_qrows(gsrc, &dm.idx, gdst, 2 * dm.inter, dm.row_gu, self.top_k)?;
@@ -1342,7 +1407,10 @@ impl SparseMoe {
         {
             let (st, _) = dm.stage_gu.storage_and_layout();
             use candle::Storage;
-            let st = match &*st { Storage::Cuda(c) => c, _ => candle::bail!("cuda") };
+            let st = match &*st {
+                Storage::Cuda(c) => c,
+                _ => candle::bail!("cuda"),
+            };
             sd::qgemv_q4k_raw(st, 0, &dm.x32, &dm.gu_out, dm.h, self.top_k * 2 * dm.inter)?;
         }
         sd::moe_silu_mul(&dm.gu_out, &dm.hbuf, dm.inter, self.top_k)?;
@@ -1350,7 +1418,10 @@ impl SparseMoe {
         {
             let (st, _) = dm.stage_dn.storage_and_layout();
             use candle::Storage;
-            let st = match &*st { Storage::Cuda(c) => c, _ => candle::bail!("cuda") };
+            let st = match &*st {
+                Storage::Cuda(c) => c,
+                _ => candle::bail!("cuda"),
+            };
             for j in 0..self.top_k {
                 let hj = dm.hbuf.narrow(0, j * dm.inter, dm.inter)?;
                 let pj = dm.part.i(j)?;
@@ -1463,7 +1534,8 @@ impl DecoderLayer {
         } else {
             Ffn::Dense(Mlp::new(
                 cfg.hidden_size,
-                cfg.intermediate_size.expect("dense layer needs intermediate_size"),
+                cfg.intermediate_size
+                    .expect("dense layer needs intermediate_size"),
                 vb.pp("mlp"),
             )?)
         };
@@ -1528,7 +1600,9 @@ fn dbg_stats(tag: &str, x: &Tensor) -> Result<()> {
     eprintln!(
         "{tag} mean={mean:.5} std={:.5} first3={:?}",
         var.max(0.0).sqrt(),
-        f3.iter().map(|x| (x * 10000.0).round() / 10000.0).collect::<Vec<_>>()
+        f3.iter()
+            .map(|x| (x * 10000.0).round() / 10000.0)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -1575,11 +1649,8 @@ impl Model {
         } else {
             vb.pp("model")
         };
-        let embed_tokens = candle_nn::embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            root.pp("embed_tokens"),
-        )?;
+        let embed_tokens =
+            candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, root.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = root.pp("layers");
         for i in 0..cfg.num_hidden_layers {

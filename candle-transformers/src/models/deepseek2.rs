@@ -608,7 +608,7 @@ impl Module for Proj {
 /// this first did) puts the experts alone at ~10.5 GB for a "4-bit" load;
 /// Q4_0 keeps them near 8 GB, which is what lets the model fit a 16 GB card.
 fn quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
-    if k % 256 == 0 {
+    if k.is_multiple_of(256) {
         return requested;
     }
     match requested {
@@ -616,24 +616,6 @@ fn quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
         GgmlDType::Q5K => GgmlDType::Q5_0,
         GgmlDType::Q6K => GgmlDType::Q8_0,
         other => other,
-    }
-}
-
-#[cfg(test)]
-mod quant_tests {
-    use super::*;
-
-    #[test]
-    fn k_quants_fall_back_to_the_block_format_of_the_same_width() {
-        // 2048 (hidden) is a multiple of 256: the request stands.
-        assert_eq!(quant_dtype_for(2048, GgmlDType::Q4K), GgmlDType::Q4K);
-        // 1408 (expert down_proj) and 10944 (dense down_proj) are not.
-        assert_eq!(quant_dtype_for(1408, GgmlDType::Q4K), GgmlDType::Q4_0);
-        assert_eq!(quant_dtype_for(10944, GgmlDType::Q3K), GgmlDType::Q4_0);
-        assert_eq!(quant_dtype_for(1408, GgmlDType::Q5K), GgmlDType::Q5_0);
-        assert_eq!(quant_dtype_for(1408, GgmlDType::Q6K), GgmlDType::Q8_0);
-        // Block formats are 32 wide and need no fallback.
-        assert_eq!(quant_dtype_for(1408, GgmlDType::Q8_0), GgmlDType::Q8_0);
     }
 }
 
@@ -1260,5 +1242,23 @@ impl DeepSeekV2 {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    #[test]
+    fn k_quants_fall_back_to_the_block_format_of_the_same_width() {
+        // 2048 (hidden) is a multiple of 256: the request stands.
+        assert_eq!(quant_dtype_for(2048, GgmlDType::Q4K), GgmlDType::Q4K);
+        // 1408 (expert down_proj) and 10944 (dense down_proj) are not.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q4K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(10944, GgmlDType::Q3K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q5K), GgmlDType::Q5_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q6K), GgmlDType::Q8_0);
+        // Block formats are 32 wide and need no fallback.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q8_0), GgmlDType::Q8_0);
     }
 }

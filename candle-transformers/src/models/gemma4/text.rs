@@ -34,23 +34,28 @@ pub mod qcache {
         STATE.get_or_init(|| {
             let st = std::env::var("GEMMA4_QCACHE_FILE").ok().map(|p| {
                 let path = std::path::PathBuf::from(p);
-                let reader = std::fs::File::open(&path).ok().and_then(|mut f| {
-                    match gguf_file::Content::read(&mut f) {
-                        Ok(c) => {
-                            eprintln!(
-                                "[gemma4-qcache] using cache {} ({} tensors)",
-                                path.display(),
-                                c.tensor_infos.len()
-                            );
-                            Some((c, f))
-                        }
-                        Err(e) => {
-                            eprintln!("[gemma4-qcache] unreadable cache ({e}), rebuilding");
-                            None
-                        }
-                    }
-                });
-                State { path, reader, pending: Vec::new() }
+                let reader =
+                    std::fs::File::open(&path).ok().and_then(
+                        |mut f| match gguf_file::Content::read(&mut f) {
+                            Ok(c) => {
+                                eprintln!(
+                                    "[gemma4-qcache] using cache {} ({} tensors)",
+                                    path.display(),
+                                    c.tensor_infos.len()
+                                );
+                                Some((c, f))
+                            }
+                            Err(e) => {
+                                eprintln!("[gemma4-qcache] unreadable cache ({e}), rebuilding");
+                                None
+                            }
+                        },
+                    );
+                State {
+                    path,
+                    reader,
+                    pending: Vec::new(),
+                }
             });
             Mutex::new(st)
         })
@@ -139,7 +144,13 @@ impl Proj {
                 // K-quants require the reduction dim % 256 == 0.
                 let dtype = moe_quant_dtype_for(in_dim, dtype);
                 if std::env::var("GEMMA4_QDEBUG").is_ok() {
-                    eprintln!("[qdebug] Proj {} in={} out={} dtype={:?}", vb.prefix(), in_dim, out_dim, dtype);
+                    eprintln!(
+                        "[qdebug] Proj {} in={} out={} dtype={:?}",
+                        vb.prefix(),
+                        in_dim,
+                        out_dim,
+                        dtype
+                    );
                 }
                 let dev = vb.device().clone();
                 let cache_key = vb.prefix();
@@ -346,9 +357,27 @@ impl MLP {
         vb: VarBuilder,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
-        let gate_proj = Proj::new(hidden_size, intermediate_size, bias, vb.pp("gate_proj"), quant)?;
-        let up_proj = Proj::new(hidden_size, intermediate_size, bias, vb.pp("up_proj"), quant)?;
-        let down_proj = Proj::new(intermediate_size, hidden_size, bias, vb.pp("down_proj"), quant)?;
+        let gate_proj = Proj::new(
+            hidden_size,
+            intermediate_size,
+            bias,
+            vb.pp("gate_proj"),
+            quant,
+        )?;
+        let up_proj = Proj::new(
+            hidden_size,
+            intermediate_size,
+            bias,
+            vb.pp("up_proj"),
+            quant,
+        )?;
+        let down_proj = Proj::new(
+            intermediate_size,
+            hidden_size,
+            bias,
+            vb.pp("down_proj"),
+            quant,
+        )?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -390,7 +419,13 @@ type RoutingPlan = Vec<Vec<(usize, f32)>>;
 
 impl Router {
     fn new(cfg: &Gemma4TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
-        let proj = Proj::new(cfg.hidden_size, cfg.num_experts, false, vb.pp("proj"), quant)?;
+        let proj = Proj::new(
+            cfg.hidden_size,
+            cfg.num_experts,
+            false,
+            vb.pp("proj"),
+            quant,
+        )?;
         let scale = vb.get(cfg.hidden_size, "scale")?;
         let per_expert_scale_t = vb
             .get(cfg.num_experts, "per_expert_scale")?
@@ -486,7 +521,7 @@ fn moe_quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
         requested,
         GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
     );
-    if needs_256 && k % 256 != 0 {
+    if needs_256 && !k.is_multiple_of(256) {
         GgmlDType::Q8_0
     } else {
         requested
@@ -540,7 +575,9 @@ impl Experts {
                 let down = if let Some(q) = qcache::get(&dn_key, &dev) {
                     Arc::new(q)
                 } else {
-                    let t = vb.get((e, h, inter), "down_proj")?.to_device(&Device::Cpu)?;
+                    let t = vb
+                        .get((e, h, inter), "down_proj")?
+                        .to_device(&Device::Cpu)?;
                     let q = Arc::new(QTensor::quantize_onto(&t, dn_dtype, &dev)?);
                     qcache::put(&dn_key, &q);
                     q
@@ -558,7 +595,10 @@ impl Experts {
                     let d = down.i(i)?.to_dtype(DType::F32)?.contiguous()?;
                     dn.push(QMatMul::from_qtensor(QTensor::quantize(&d, dtype)?)?);
                 }
-                ExpertWeights::Quant { gate_up: gu, down: dn }
+                ExpertWeights::Quant {
+                    gate_up: gu,
+                    down: dn,
+                }
             }
         };
         Ok(Self {
@@ -599,8 +639,8 @@ impl Experts {
 
         let x32 = xs_flat.to_dtype(DType::F32)?.reshape((tokens, 1, hidden))?;
         let gu = gate_up.indexed_moe_forward(&x32, ids)?; // [tokens, topk, 2*inter]
-        // Single-launch act(gate) * up (item-3 fusion); falls back to the
-        // chunk/act/mul composition off-CUDA.
+                                                          // Single-launch act(gate) * up (item-3 fusion); falls back to the
+                                                          // chunk/act/mul composition off-CUDA.
         let act = match self.act_fn {
             Activation::Silu => candle_nn::fused::SwigluAct::Silu,
             _ => candle_nn::fused::SwigluAct::GeluTanh,
@@ -801,8 +841,9 @@ impl Attention {
         // older aux files keep loading. GEMMA4_QUANT_GLOBAL=1 forces the old
         // fully-quantized behavior.
         let quant = if !is_sliding && quant.is_some() {
-            let force_quant =
-                std::env::var("GEMMA4_QUANT_GLOBAL").map(|v| v == "1").unwrap_or(false);
+            let force_quant = std::env::var("GEMMA4_QUANT_GLOBAL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let raw_avail =
                 vb.contains_tensor("q_proj.weight") && vb.contains_tensor("o_proj.weight");
             if force_quant {
@@ -852,7 +893,13 @@ impl Attention {
         // norms diverge afterwards: K gets k_norm+RoPE, V only the unscaled
         // v_norm).
         let k_eq_v = cfg.attention_k_eq_v && !is_sliding;
-        let q_proj = Proj::new(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"), quant)?;
+        let q_proj = Proj::new(
+            hidden_sz,
+            num_heads * head_dim,
+            bias,
+            vb.pp("q_proj"),
+            quant,
+        )?;
         let (k_proj, v_proj, k_norm) = if is_kv_shared {
             (None, None, None)
         } else {
@@ -879,7 +926,13 @@ impl Attention {
                 Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?),
             )
         };
-        let o_proj = Proj::new(num_heads * head_dim, hidden_sz, bias, vb.pp("o_proj"), quant)?;
+        let o_proj = Proj::new(
+            num_heads * head_dim,
+            hidden_sz,
+            bias,
+            vb.pp("o_proj"),
+            quant,
+        )?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
 
         let kv_cache = if is_sliding {
@@ -1161,7 +1214,10 @@ impl Attention {
         // when klen > qlen == exactly chunk semantics; sliding layers use
         // the windowed-causal variant.
         #[cfg(feature = "flash-attn")]
-        if std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("EXP1_FLASH_PREFILL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             let q_fa = q.transpose(1, 2)?.contiguous()?; // [1, C, h, hd]
             let k_fa = kbuf
                 .narrow(1, 0, klen)?
@@ -1221,8 +1277,7 @@ impl Attention {
         } else {
             None
         };
-        let mask =
-            prepare_decoder_attention_mask(1, t_len, pos, window, xs.dtype(), xs.device())?;
+        let mask = prepare_decoder_attention_mask(1, t_len, pos, window, xs.dtype(), xs.device())?;
         // Softmax scale 1.0 (q_norm absorbs it) — mirrors the dynamic path.
         let attn = q.contiguous()?.matmul(&kpre.transpose(2, 3)?)?;
         let attn = attn.broadcast_add(&mask)?;
@@ -1342,14 +1397,17 @@ impl Attention {
             &cctx.mask_global
         };
         let attn = q.contiguous()?.matmul(&kfull.transpose(2, 3)?)?; // [1,h,C,cap]
-        // Match the host/dynamic paths' dtype ordering (bf16 mask-add +
-        // softmax). The old F32-upcast ordering attenuated long-range
-        // attention step-proportionally at scale (batch-4 root cause #2:
-        // needle logit sank ~0.5/chunk, killing retrieval past ~2 chunks) —
-        // exact mechanism filed as a softmax-kernel question;
-        // GEMMA4_DEV_SOFTMAX_F32=1 restores the old ordering for study.
+                                                                     // Match the host/dynamic paths' dtype ordering (bf16 mask-add +
+                                                                     // softmax). The old F32-upcast ordering attenuated long-range
+                                                                     // attention step-proportionally at scale (batch-4 root cause #2:
+                                                                     // needle logit sank ~0.5/chunk, killing retrieval past ~2 chunks) —
+                                                                     // exact mechanism filed as a softmax-kernel question;
+                                                                     // GEMMA4_DEV_SOFTMAX_F32=1 restores the old ordering for study.
         let mcols = mask.dim(1)?; // max_seq (global) or ring_len (sliding)
-        let attn = if std::env::var("GEMMA4_DEV_SOFTMAX_F32").map(|v| v == "1").unwrap_or(false) {
+        let attn = if std::env::var("GEMMA4_DEV_SOFTMAX_F32")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             let attn = attn.to_dtype(DType::F32)?;
             attn.broadcast_add(&mask.reshape((1, 1, t_len, mcols))?)?
         } else {
@@ -1366,7 +1424,12 @@ impl Attention {
             let mx = |t: &Tensor| -> f32 {
                 t.to_dtype(DType::F32)
                     .and_then(|x| x.flatten_all()?.to_vec1::<f32>())
-                    .map(|v| v.iter().cloned().filter(|x| x.is_finite()).fold(f32::MIN, f32::max))
+                    .map(|v| {
+                        v.iter()
+                            .cloned()
+                            .filter(|x| x.is_finite())
+                            .fold(f32::MIN, f32::max)
+                    })
                     .unwrap_or(f32::NAN)
             };
             eprintln!(
@@ -1453,8 +1516,10 @@ impl Attention {
             candle_nn::fused::static_decode::kv_write(
                 &kbuf,
                 &vbuf,
-                &k.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
-                &v.reshape((self.num_kv_heads, self.head_dim))?.contiguous()?,
+                &k.reshape((self.num_kv_heads, self.head_dim))?
+                    .contiguous()?,
+                &v.reshape((self.num_kv_heads, self.head_dim))?
+                    .contiguous()?,
                 &ctx.pos,
             )?;
             if self.store_full_length_kv {
@@ -1607,7 +1672,10 @@ impl DecoderLayer {
         // 2*intermediate_size in the trailing `num_kv_shared_layers` layers.
         let mut mlp_intermediate_size = cfg.intermediate_size;
         if cfg.use_double_wide_mlp
-            && layer_idx >= cfg.num_hidden_layers.saturating_sub(cfg.num_kv_shared_layers)
+            && layer_idx
+                >= cfg
+                    .num_hidden_layers
+                    .saturating_sub(cfg.num_kv_shared_layers)
         {
             mlp_intermediate_size *= 2;
         }
@@ -1765,7 +1833,9 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward_static_chunk_dev(&xs, ctx, shared_kv)?;
+        let xs = self
+            .self_attn
+            .forward_static_chunk_dev(&xs, ctx, shared_kv)?;
         if std::env::var("GEMMA4_CHUNK_DEBUG").is_ok() {
             if let Ok(v) = xs
                 .to_dtype(DType::F32)
@@ -1827,9 +1897,9 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
-            .self_attn
-            .forward_static_chunk(&xs, ctx, shared_kv, pos, sliding_ring_mask)?;
+        let xs =
+            self.self_attn
+                .forward_static_chunk(&xs, ctx, shared_kv, pos, sliding_ring_mask)?;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let (xs_res, ffw_in) = candle_nn::fused::fused_add_rmsnorm(
             &xs,
@@ -2106,7 +2176,13 @@ impl TextModel {
                 None => Proj::Plain(Linear::new(embed_tokens.embeddings().clone(), None)),
             }
         } else {
-            Proj::new(cfg.hidden_size, cfg.vocab_size, false, vb.pp("lm_head"), quant)?
+            Proj::new(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                vb.pp("lm_head"),
+                quant,
+            )?
         };
 
         let (embed_tokens_per_layer, per_layer_model_projection, per_layer_projection_norm) =
@@ -2162,7 +2238,11 @@ impl TextModel {
     /// per-layer embedding lookup) plus context component (projection of the
     /// scaled input embeddings), each normalized/scaled as in the reference
     /// implementation. Shape: [batch, seq, num_layers, per_layer_dim].
-    fn per_layer_inputs(&self, input_ids: &Tensor, inputs_embeds: &Tensor) -> Result<Option<Tensor>> {
+    fn per_layer_inputs(
+        &self,
+        input_ids: &Tensor,
+        inputs_embeds: &Tensor,
+    ) -> Result<Option<Tensor>> {
         let (Some(ple_embed), Some(proj), Some(norm)) = (
             self.embed_tokens_per_layer.as_ref(),
             self.per_layer_model_projection.as_ref(),
@@ -2223,7 +2303,13 @@ impl TextModel {
         let (b_size, seq_len) = input_ids.dims2()?;
         let xs = self.embed_tokens(input_ids)?;
         let per_layer_inputs = self.per_layer_inputs(input_ids, &xs)?;
-        self.forward_embeds(&xs, per_layer_inputs.as_ref(), seqlen_offset, b_size, seq_len)
+        self.forward_embeds(
+            &xs,
+            per_layer_inputs.as_ref(),
+            seqlen_offset,
+            b_size,
+            seq_len,
+        )
     }
 
     pub fn forward_embeds(
@@ -2281,8 +2367,12 @@ impl TextModel {
     /// EXP1_FLASH_PREFILL=1 disables (the FA2 prefill path narrows the
     /// buffer prefix [0, klen), which a ring breaks).
     fn ring_kv_len(&self, max_seq: usize) -> usize {
-        let off = std::env::var("GEMMA4_RING_KV").map(|v| v == "0").unwrap_or(false)
-            || std::env::var("EXP1_FLASH_PREFILL").map(|v| v == "1").unwrap_or(false);
+        let off = std::env::var("GEMMA4_RING_KV")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+            || std::env::var("EXP1_FLASH_PREFILL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         if off || self.sliding_window == 0 {
             return max_seq;
         }
@@ -2401,8 +2491,16 @@ impl TextModel {
             let row_stat = |r: usize| -> (usize, i32, i32) {
                 let row = &m[r];
                 let valid = row.iter().filter(|v| **v == 0.0).count();
-                let first = row.iter().position(|v| *v == 0.0).map(|i| i as i32).unwrap_or(-1);
-                let last = row.iter().rposition(|v| *v == 0.0).map(|i| i as i32).unwrap_or(-1);
+                let first = row
+                    .iter()
+                    .position(|v| *v == 0.0)
+                    .map(|i| i as i32)
+                    .unwrap_or(-1);
+                let last = row
+                    .iter()
+                    .rposition(|v| *v == 0.0)
+                    .map(|i| i as i32)
+                    .unwrap_or(-1);
                 (valid, first, last)
             };
             let garbage = m
@@ -2425,7 +2523,10 @@ impl TextModel {
                     .to_dtype(DType::F32)
                     .and_then(|x| x.abs()?.mean_all()?.to_scalar::<f32>())
                 {
-                    eprintln!("[chunk-dbg] {tag}: mean_abs={v:.5} finite={}", v.is_finite());
+                    eprintln!(
+                        "[chunk-dbg] {tag}: mean_abs={v:.5} finite={}",
+                        v.is_finite()
+                    );
                 }
             }
         };
@@ -2516,7 +2617,10 @@ impl TextModel {
             let x = t.to_dtype(DType::F32)?;
             let mean = x.abs()?.mean_all()?.to_scalar::<f32>()?;
             let dims = x.dims();
-            let last = x.narrow(1, dims[1] - 1, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            let last = x
+                .narrow(1, dims[1] - 1, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
             Ok((mean, last[..4.min(last.len())].to_vec()))
         })();
         if let Ok((mean, head)) = f {
@@ -2694,6 +2798,7 @@ mod tests {
 
     /// Dense tiny config (no MoE) with a k_eq_v global layer — the batch-4
     /// chunk-machinery parity surface.
+    #[cfg(feature = "cuda")] // only the CUDA parity test builds this model
     fn dense_test_config() -> Gemma4TextConfig {
         serde_json::from_str(
             r#"{
@@ -2722,7 +2827,11 @@ mod tests {
 
     /// Deterministic non-zero weights: learn names/shapes via a VarMap build,
     /// then rebuild a from_tensors VarBuilder (norms near 1, rest small).
-    fn dense_test_weights(cfg: &Gemma4TextConfig, dev: &Device) -> Result<std::collections::HashMap<String, Tensor>> {
+    #[cfg(feature = "cuda")] // only the CUDA parity test builds this model
+    fn dense_test_weights(
+        cfg: &Gemma4TextConfig,
+        dev: &Device,
+    ) -> Result<std::collections::HashMap<String, Tensor>> {
         let varmap = candle_nn::VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
         let _ = TextModel::new(cfg, vb)?;
@@ -2801,7 +2910,11 @@ mod tests {
             let mut m = build()?;
             m.enable_static_decode(32)?;
             let lg = m.prefill_static_chunked(&ids_t)?;
-            cmp(&format!("eager-chunk{chunk} vs dynamic"), &r_dyn, &vec_of(&lg)?);
+            cmp(
+                &format!("eager-chunk{chunk} vs dynamic"),
+                &r_dyn,
+                &vec_of(&lg)?,
+            );
         }
         std::env::remove_var("GEMMA4_PREFILL_CHUNK");
 
@@ -2818,7 +2931,11 @@ mod tests {
             m.enable_static_decode(32)?;
             m.enable_chunk_graph(chunk)?;
             let lg = m.prefill_static_graph(&ids_t)?;
-            cmp(&format!("eager-devstep-chunk{chunk} vs dynamic"), &r_dyn, &vec_of(&lg)?);
+            cmp(
+                &format!("eager-devstep-chunk{chunk} vs dynamic"),
+                &r_dyn,
+                &vec_of(&lg)?,
+            );
         }
         std::env::remove_var("GEMMA4_PREFILL_CHUNK");
 
@@ -2911,7 +3028,9 @@ mod tests {
             let known_issue = tag.contains("chunk20") || tag.contains("chunk10");
             if known_issue {
                 if *nan > 0 || *max_rel >= 0.15 {
-                    eprintln!("[parity] KNOWN-ISSUE (chunk>window): {tag} max_rel={max_rel} nan={nan}");
+                    eprintln!(
+                        "[parity] KNOWN-ISSUE (chunk>window): {tag} max_rel={max_rel} nan={nan}"
+                    );
                 }
                 continue;
             }
