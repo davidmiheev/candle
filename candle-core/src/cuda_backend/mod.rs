@@ -18,6 +18,7 @@ pub mod cudnn;
 mod device;
 mod error;
 mod utils;
+pub mod graph;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
@@ -2582,6 +2583,32 @@ unsafe fn gemm_strided_batched_f32(
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
 
+    if cfg.batch_size == 1 {
+        // Plain (non-batched) GEMM: functionally identical for batch 1 and,
+        // unlike the strided-batched path, safe to record/replay inside a
+        // CUDA graph (the batched kernels raise ILLEGAL_ADDRESS at replay).
+        return cudarc::cublas::result::gemm_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.lda,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.ldb,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.ldc,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        );
+    }
     cudarc::cublas::result::gemm_strided_batched_ex(
         *cublas.handle(),
         cfg.gemm.transa,
@@ -2641,6 +2668,32 @@ unsafe fn gemm_strided_batched_f16(
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
+    if cfg.batch_size == 1 {
+        // Plain (non-batched) GEMM: functionally identical for batch 1 and,
+        // unlike the strided-batched path, safe to record/replay inside a
+        // CUDA graph (the batched kernels raise ILLEGAL_ADDRESS at replay).
+        return cudarc::cublas::result::gemm_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.lda,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.ldb,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.ldc,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        );
+    }
     cudarc::cublas::result::gemm_strided_batched_ex(
         *cublas.handle(),
         cfg.gemm.transa,
@@ -2700,6 +2753,36 @@ unsafe fn gemm_strided_batched_bf16(
     let (a, _guard_a) = a.device_ptr(&stream);
     let (b, _guard_b) = b.device_ptr(&stream);
     let (c, _guard_c) = c.device_ptr_mut(&stream);
+    if std::env::var("CANDLE_GEMM_DEBUG").is_ok() {
+        eprintln!("[gemm bf16] batch={} m={} n={} k={} lda={} ldb={} ldc={} sa={} sb={}",
+            cfg.batch_size, cfg.gemm.m, cfg.gemm.n, cfg.gemm.k, cfg.gemm.lda, cfg.gemm.ldb, cfg.gemm.ldc, cfg.stride_a, cfg.stride_b);
+    }
+    if cfg.batch_size == 1 {
+        // Plain (non-batched) GEMM: functionally identical for batch 1 and,
+        // unlike the strided-batched path, safe to record/replay inside a
+        // CUDA graph (the batched kernels raise ILLEGAL_ADDRESS at replay).
+        return cudarc::cublas::result::gemm_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.lda,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.ldb,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.ldc,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        );
+    }
     cudarc::cublas::result::gemm_strided_batched_ex(
         *cublas.handle(),
         cfg.gemm.transa,

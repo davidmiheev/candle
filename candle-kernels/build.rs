@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
+    // Track the whole source tree so added/edited kernels retrigger the
+    // PTX generation (previously only 4 files were watched, so new .cu
+    // files silently produced a stale ptx.rs).
+    println!("cargo::rerun-if-changed=src");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
@@ -20,6 +24,75 @@ fn main() -> Result<()> {
         .build_ptx()?;
 
     bindings.write(&ptx_path)?;
+
+    // ── D-fatbin: optional SASS embedding (JIT escape) ────────────────────
+    // CANDLE_CUBIN=1 compiles every PTX-table kernel to a cubin for the
+    // build arch and embeds it; the loader then feeds the driver SASS via
+    // cuModuleLoad, skipping runtime JIT entirely (cold-start win) and any
+    // toolkit-vs-driver PTX version coupling. Default off => images.rs is
+    // all-None and behavior is unchanged.
+    println!("cargo::rerun-if-env-changed=CANDLE_CUBIN");
+    let images_path = out_dir.join("images.rs");
+    let excluded = |name: &str| {
+        name.starts_with("moe_")
+            || name.starts_with("mmq_")
+            || name == "mmvq_gguf"
+    };
+    let mut stems: Vec<String> = std::fs::read_dir("src")
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension()? != "cu" {
+                return None;
+            }
+            let stem = p.file_stem()?.to_str()?.to_string();
+            if excluded(&stem) {
+                None
+            } else {
+                Some(stem)
+            }
+        })
+        .collect();
+    stems.sort();
+    let cubin_on = env::var("CANDLE_CUBIN").map(|v| v == "1").unwrap_or(false);
+    let mut images_src = String::new();
+    if cubin_on {
+        let arch = cudaforge::detect_compute_cap()
+            .map(|a| a.base())
+            .unwrap_or(120);
+        for stem in &stems {
+            let cubin = out_dir.join(format!("{stem}.cubin"));
+            let status = std::process::Command::new("nvcc")
+                .args([
+                    "-cubin",
+                    "-O3",
+                    "-std=c++17",
+                    "--expt-relaxed-constexpr",
+                    &format!("-arch=sm_{arch}"),
+                    "-o",
+                ])
+                .arg(&cubin)
+                .arg(format!("src/{stem}.cu"))
+                .status()
+                .expect("nvcc -cubin spawn");
+            assert!(status.success(), "nvcc -cubin failed for {stem}");
+            images_src.push_str(&format!(
+                "pub const {}: Option<&'static [u8]> = Some(include_bytes!({:?}));
+",
+                stem.to_uppercase(),
+                cubin
+            ));
+        }
+    } else {
+        for stem in &stems {
+            images_src.push_str(&format!(
+                "pub const {}: Option<&'static [u8]> = None;
+",
+                stem.to_uppercase()
+            ));
+        }
+    }
+    std::fs::write(&images_path, images_src).unwrap();
 
     let mut moe_builder = KernelBuilder::default()
         .source_files(vec![
