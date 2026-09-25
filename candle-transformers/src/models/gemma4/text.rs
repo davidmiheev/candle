@@ -2000,6 +2000,23 @@ impl TextModel {
         Self::new_with_quant(cfg, vb, None)
     }
 
+    /// Like [`Self::new`], but for a checkpoint whose text weights are nested
+    /// under the multimodal prefix.
+    ///
+    /// A text-only Gemma-4 stores its decoder at `model.*`; a multimodal one
+    /// (gemma-4-E2B-it, for instance) stores the same decoder at
+    /// `model.language_model.*` beside its vision and audio towers. The
+    /// architecture is identical, so loading the text half of a multimodal
+    /// checkpoint only needs the extra path component.
+    pub fn new_nested(
+        cfg: &Gemma4TextConfig,
+        vb: VarBuilder,
+        nested_under: &str,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        Self::new_with_quant_at(cfg, vb.pp("model").pp(nested_under), quant)
+    }
+
     /// Like [`Self::new`], but with `quant` set every linear projection is
     /// quantized to that GGML dtype at load time (activations stay in the
     /// VarBuilder dtype) and the gather-only embedding tables are stored in
@@ -2009,7 +2026,17 @@ impl TextModel {
         vb: VarBuilder,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
-        let vb_m = vb.pp("model");
+        Self::new_with_quant_at(cfg, vb.pp("model"), quant)
+    }
+
+    /// The body of [`Self::new_with_quant`], taking the decoder's own prefix
+    /// rather than deriving it, so a nested checkpoint can reuse it verbatim.
+    pub fn new_with_quant_at(
+        cfg: &Gemma4TextConfig,
+        vb_m: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        let vb = vb_m.clone();
         let embed_dtype = if quant.is_some() {
             DType::F16
         } else {
