@@ -3,8 +3,10 @@
 use std::{f32::consts::PI, sync::Arc};
 
 use candle::{
-    shape::Dim, CpuStorage, CustomOp1, DType, Device, Error, IndexOp, Layout, Result, Shape,
-    Tensor, WithDType, D,
+    quantized::{GgmlDType, QMatMul, QTensor},
+    shape::Dim,
+    CpuStorage, CustomOp1, DType, Device, Error, IndexOp, Layout, Result, Shape, Tensor, WithDType,
+    D,
 };
 use candle_nn::{embedding, rms_norm, Activation, Embedding, Linear, Module, RmsNorm, VarBuilder};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -518,9 +520,126 @@ impl DeepSeekV2Config {
     }
 }
 
-enum QProj {
+/// A projection that is either a plain `Linear` or quantized at load time.
+///
+/// DeepSeek-V2-Lite is 15.7B parameters, which is 31.4 GB in f16 — twice what a
+/// 16 GB card holds. Quantizing on the way in is the difference between running
+/// the model and reading its config. The pattern (quantize on the CPU so the
+/// full f32 weight never lands on the GPU, then keep a `QMatMul`) is the one
+/// `gemma4` and `qwen3_5` already use in this crate.
+enum Proj {
     Plain(Linear),
-    Lora { a: Linear, norm: RmsNorm, b: Linear },
+    Quant {
+        weight: QMatMul,
+        bias: Option<Tensor>,
+    },
+}
+
+impl Proj {
+    fn new(
+        in_dim: usize,
+        out_dim: usize,
+        bias: bool,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
+        match quant {
+            None => Ok(Self::Plain(candle_nn::linear_b(in_dim, out_dim, bias, vb)?)),
+            Some(dtype) => {
+                let dtype = quant_dtype_for(in_dim, dtype);
+                let device = vb.device().clone();
+                // Read the weight straight onto the CPU and quantize it there:
+                // staging each float weight on the GPU first ran a 16 GB T4
+                // out of memory partway through loading, although the
+                // quantized model is about 9 GB.
+                let weight = vb
+                    .clone()
+                    .set_device(Device::Cpu)
+                    .get((out_dim, in_dim), "weight")?;
+                let weight = if device.is_cuda() {
+                    QTensor::quantize_onto(&weight, dtype, &device)?
+                } else {
+                    QTensor::quantize(&weight.to_dtype(DType::F32)?, dtype)?
+                };
+                let bias = if bias {
+                    Some(vb.get(out_dim, "bias")?.to_dtype(DType::F32)?)
+                } else {
+                    None
+                };
+                Ok(Self::Quant {
+                    weight: QMatMul::QTensor(std::sync::Arc::new(weight)),
+                    bias,
+                })
+            }
+        }
+    }
+}
+
+impl Module for Proj {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Plain(lin) => lin.forward(xs),
+            Self::Quant { weight, bias } => {
+                // The CUDA quantized matmul's decode (vector) path reads f32
+                // activations only and upgrades just bf16 itself; f16 fails.
+                // Run the product in f32 and hand back the caller's dtype.
+                let in_dtype = xs.dtype();
+                let ys = weight.forward(&xs.to_dtype(DType::F32)?)?;
+                let ys = match bias {
+                    Some(bias) => ys.broadcast_add(bias)?,
+                    None => ys,
+                };
+                ys.to_dtype(in_dtype)
+            }
+        }
+    }
+}
+
+/// K-quants need the reduction dimension to be a multiple of 256.
+///
+/// DeepSeek-V2-Lite trips this twice: the dense MLP's `down_proj` reduces over
+/// 10944 and each expert's over 1408, neither divisible by 256. Both are
+/// multiples of 32, which the 32-wide block formats accept, so those layers
+/// take the block format of the same bit width rather than failing or
+/// silently producing a broken tensor.
+///
+/// The width matters: the experts are ~14.4B of the model's 15.7B parameters
+/// and one third of each expert is a `down_proj`. Falling back to Q8_0 (as
+/// this first did) puts the experts alone at ~10.5 GB for a "4-bit" load;
+/// Q4_0 keeps them near 8 GB, which is what lets the model fit a 16 GB card.
+fn quant_dtype_for(k: usize, requested: GgmlDType) -> GgmlDType {
+    if k % 256 == 0 {
+        return requested;
+    }
+    match requested {
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K => GgmlDType::Q4_0,
+        GgmlDType::Q5K => GgmlDType::Q5_0,
+        GgmlDType::Q6K => GgmlDType::Q8_0,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    #[test]
+    fn k_quants_fall_back_to_the_block_format_of_the_same_width() {
+        // 2048 (hidden) is a multiple of 256: the request stands.
+        assert_eq!(quant_dtype_for(2048, GgmlDType::Q4K), GgmlDType::Q4K);
+        // 1408 (expert down_proj) and 10944 (dense down_proj) are not.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q4K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(10944, GgmlDType::Q3K), GgmlDType::Q4_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q5K), GgmlDType::Q5_0);
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q6K), GgmlDType::Q8_0);
+        // Block formats are 32 wide and need no fallback.
+        assert_eq!(quant_dtype_for(1408, GgmlDType::Q8_0), GgmlDType::Q8_0);
+    }
+}
+
+enum QProj {
+    Plain(Proj),
+    Lora { a: Proj, norm: RmsNorm, b: Proj },
 }
 
 impl QProj {
@@ -534,10 +653,10 @@ impl QProj {
 
 struct Attention {
     q: QProj,
-    kv_a_proj_with_mqa: Linear,
+    kv_a_proj_with_mqa: Proj,
     kv_a_layernorm: RmsNorm,
-    kv_b_proj: Linear,
-    o_proj: Linear,
+    kv_b_proj: Proj,
+    o_proj: Proj,
     rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
     cfg: DeepSeekV2Config,
     q_head_dim: usize,
@@ -550,49 +669,59 @@ impl Attention {
         rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
         cfg: &DeepSeekV2Config,
         vb: VarBuilder,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let q_head_dim = cfg.q_head_dim();
         let q = match cfg.q_lora_rank {
             Some(lora_rank) => {
-                let a = candle_nn::linear_b(
+                let a = Proj::new(
                     cfg.hidden_size,
                     lora_rank,
                     cfg.attention_bias,
                     vb.pp("q_a_proj"),
+                    quant,
                 )?;
                 let norm = rms_norm(lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
-                let b = candle_nn::linear_no_bias(
+                let b = Proj::new(
                     lora_rank,
                     cfg.num_attention_heads * q_head_dim,
+                    false,
                     vb.pp("q_b_proj"),
+                    quant,
                 )?;
                 QProj::Lora { a, norm, b }
             }
-            None => QProj::Plain(candle_nn::linear_no_bias(
+            None => QProj::Plain(Proj::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads * q_head_dim,
+                false,
                 vb.pp("q_proj"),
+                quant,
             )?),
         };
 
-        let kv_a_proj_with_mqa = candle_nn::linear_b(
+        let kv_a_proj_with_mqa = Proj::new(
             cfg.hidden_size,
             cfg.kv_lora_rank + cfg.qk_rope_head_dim,
             cfg.attention_bias,
             vb.pp("kv_a_proj_with_mqa"),
+            quant,
         )?;
         let kv_a_layernorm = rms_norm(cfg.kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
-        let kv_b_proj = candle_nn::linear_no_bias(
+        let kv_b_proj = Proj::new(
             cfg.kv_lora_rank,
             cfg.num_attention_heads * (q_head_dim - cfg.qk_rope_head_dim + cfg.v_head_dim),
+            false,
             vb.pp("kv_b_proj"),
+            quant,
         )?;
 
-        let o_proj = candle_nn::linear_b(
+        let o_proj = Proj::new(
             cfg.num_attention_heads * cfg.v_head_dim,
             cfg.hidden_size,
             cfg.attention_bias,
             vb.pp("o_proj"),
+            quant,
         )?;
 
         Ok(Self {
@@ -699,9 +828,9 @@ impl Attention {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
     act: Activation,
 }
 
@@ -711,14 +840,33 @@ impl Mlp {
         vb: VarBuilder,
         hidden_size: Option<usize>,
         intermediate_size: Option<usize>,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let hidden_size = hidden_size.unwrap_or(cfg.hidden_size);
         let intermediate_size = intermediate_size.unwrap_or(cfg.intermediate_size);
 
         Ok(Self {
-            gate: candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-            up: candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-            down: candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+            gate: Proj::new(
+                hidden_size,
+                intermediate_size,
+                false,
+                vb.pp("gate_proj"),
+                quant,
+            )?,
+            up: Proj::new(
+                hidden_size,
+                intermediate_size,
+                false,
+                vb.pp("up_proj"),
+                quant,
+            )?,
+            down: Proj::new(
+                intermediate_size,
+                hidden_size,
+                false,
+                vb.pp("down_proj"),
+                quant,
+            )?,
             act: cfg.hidden_act,
         })
     }
@@ -819,11 +967,18 @@ impl Moe {
 
         n_shared_experts: Option<usize>,
         n_routed_experts: usize,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let mut experts = Vec::with_capacity(n_routed_experts);
         for i in 0..n_routed_experts {
             let vb_e = vb.pp("experts").pp(i);
-            experts.push(Mlp::new(cfg, vb_e, None, Some(cfg.moe_intermediate_size))?);
+            experts.push(Mlp::new(
+                cfg,
+                vb_e,
+                None,
+                Some(cfg.moe_intermediate_size),
+                quant,
+            )?);
         }
         let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
             let intermediate_size = cfg.moe_intermediate_size * n_shared_experts;
@@ -832,6 +987,7 @@ impl Moe {
                 vb.pp("shared_experts"),
                 None,
                 Some(intermediate_size),
+                quant,
             )?)
         } else {
             None
@@ -917,8 +1073,9 @@ impl DecoderLayer {
         cfg: &DeepSeekV2Config,
         vb: VarBuilder,
         layer_idx: usize,
+        quant: Option<GgmlDType>,
     ) -> Result<Self> {
-        let attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
+        let attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"), quant)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -931,13 +1088,20 @@ impl DecoderLayer {
                 && layer_idx.is_multiple_of(cfg.moe_layer_freq)
             {
                 MoeOrMlp::Moe(
-                    Moe::new(cfg, vb.pp("mlp"), cfg.n_shared_experts, n_routed_experts)?.into(),
+                    Moe::new(
+                        cfg,
+                        vb.pp("mlp"),
+                        cfg.n_shared_experts,
+                        n_routed_experts,
+                        quant,
+                    )?
+                    .into(),
                 )
             } else {
-                MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None)?.into())
+                MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None, quant)?.into())
             }
         } else {
-            MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None)?.into())
+            MoeOrMlp::Mlp(Mlp::new(cfg, vb.pp("mlp"), None, None, quant)?.into())
         };
 
         Ok(Self {
@@ -971,7 +1135,7 @@ impl DecoderLayer {
 }
 
 pub struct DeepSeekV2 {
-    lm_head: Linear,
+    lm_head: Proj,
     embed_tokens: Embedding,
     norm: RmsNorm,
     layers: Vec<DecoderLayer>,
@@ -981,13 +1145,34 @@ pub struct DeepSeekV2 {
 
 impl DeepSeekV2 {
     pub fn new(cfg: &DeepSeekV2Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_quant(cfg, vb, None)
+    }
+
+    /// Like [`Self::new`], but every projection is quantized to `quant` as it
+    /// loads. The embedding table and the norms stay in the VarBuilder's dtype.
+    pub fn new_with_quant(
+        cfg: &DeepSeekV2Config,
+        vb: VarBuilder,
+        quant: Option<GgmlDType>,
+    ) -> Result<Self> {
         let vb_m = vb.pp("model");
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
         let lm_head = if !cfg.tie_word_embeddings {
-            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+            Proj::new(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+                vb.pp("lm_head"),
+                quant,
+            )?
         } else {
-            candle_nn::Linear::new(embed_tokens.embeddings().clone(), None)
+            // Tied: reuse the embedding table rather than quantizing a second
+            // copy of it.
+            Proj::Plain(candle_nn::Linear::new(
+                embed_tokens.embeddings().clone(),
+                None,
+            ))
         };
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 
@@ -1006,7 +1191,13 @@ impl DeepSeekV2 {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(layer_idx), layer_idx)?;
+            let layer = DecoderLayer::new(
+                rotary_emb.clone(),
+                cfg,
+                vb_l.pp(layer_idx),
+                layer_idx,
+                quant,
+            )?;
             layers.push(layer)
         }
 
