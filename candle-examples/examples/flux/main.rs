@@ -23,6 +23,16 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
+    /// Weight dtype: f16, bf16 or f32. candle only builds its bf16 CUDA
+    /// kernels for sm_80 and newer, so pass f16 on older cards (a T4 is sm_75).
+    #[arg(long)]
+    dtype: Option<String>,
+
+    /// Fetch the transformer and autoencoder from this repo instead of the
+    /// gated black-forest-labs one (e.g. unsloth/FLUX.1-schnell).
+    #[arg(long)]
+    bf_repo: Option<String>,
+
     /// Use the quantized model.
     #[arg(long)]
     quantized: bool,
@@ -87,18 +97,33 @@ fn run(args: Args) -> Result<()> {
     };
 
     let api = hf_hub::api::sync::Api::new()?;
+    // black-forest-labs/FLUX.1-* are gated: without an accepted licence the
+    // download fails with a 401 and the example cannot run at all. --bf-repo
+    // points the weights (and the autoencoder, which even the quantized path
+    // needs) at an ungated mirror of the same layout.
     let bf_repo = {
-        let name = match model {
-            Model::Dev => "black-forest-labs/FLUX.1-dev",
-            Model::Schnell => "black-forest-labs/FLUX.1-schnell",
+        let name = match (args.bf_repo.as_deref(), model) {
+            (Some(repo), _) => repo.to_string(),
+            (None, Model::Dev) => "black-forest-labs/FLUX.1-dev".to_string(),
+            (None, Model::Schnell) => "black-forest-labs/FLUX.1-schnell".to_string(),
         };
-        api.repo(hf_hub::Repo::model(name.to_string()))
+        api.repo(hf_hub::Repo::model(name))
     };
     let device = candle_examples::device(cpu)?;
     if let Some(seed) = args.seed {
         device.set_seed(seed)?;
     }
-    let dtype = device.bf16_default_to_f32();
+    // bf16_default_to_f32 picks bf16 on any CUDA device, but candle only
+    // builds its bf16 kernels for sm_80+. On an sm_75 card (T4) the first
+    // matmul dies with "named symbol not found", which names the missing
+    // symbol rather than the missing build. --dtype f16 is the way out.
+    let dtype = match args.dtype.as_deref() {
+        Some("f16") => candle::DType::F16,
+        Some("bf16") => candle::DType::BF16,
+        Some("f32") => candle::DType::F32,
+        Some(other) => anyhow::bail!("unknown --dtype {other}; expected f16, bf16 or f32"),
+        None => device.bf16_default_to_f32(),
+    };
     let img = match decode_only {
         None => {
             let t5_emb = {
