@@ -187,8 +187,29 @@ impl Attention {
 fn get_rel_pos(q_size: usize, k_size: usize, rel_pos: &Tensor) -> Result<Tensor> {
     let max_rel_dist = 2 * usize::max(q_size, k_size) - 1;
     let dev = rel_pos.device();
+    // Resize the relative-position table when the runtime grid differs from
+    // the pretrain grid (torch: F.interpolate(mode='linear') over the table
+    // rows; align_corners=false semantics).
+    let interp_holder;
     let rel_pos_resized = if rel_pos.dim(0)? != max_rel_dist {
-        todo!("interpolation")
+        let (src, dim) = rel_pos.dims2()?;
+        let table: Vec<f32> = rel_pos.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let scale = src as f64 / max_rel_dist as f64;
+        let mut out = vec![0f32; max_rel_dist * dim];
+        for d_i in 0..max_rel_dist {
+            let center = (d_i as f64 + 0.5) * scale - 0.5;
+            let i0 = center.floor();
+            let frac = center - i0;
+            let a = (i0.max(0.0) as usize).min(src - 1);
+            let b = ((i0 as isize + 1).max(0) as usize).min(src - 1);
+            for c in 0..dim {
+                out[d_i * dim + c] = (table[a * dim + c] as f64 * (1.0 - frac)
+                    + table[b * dim + c] as f64 * frac) as f32;
+            }
+        }
+        interp_holder =
+            Tensor::from_vec(out, (max_rel_dist, dim), dev)?.to_dtype(rel_pos.dtype())?;
+        &interp_holder
     } else {
         rel_pos
     };
@@ -468,7 +489,30 @@ impl Module for ImageEncoderViT {
         let _enter = self.span.enter();
         let xs = self.patch_embed.forward(xs)?;
         let mut xs = match &self.pos_embed {
-            Some(pos_embed) => (xs + pos_embed)?,
+            Some(pos_embed) => {
+                // Support non-native input sizes: resize the learned grid
+                // (torch bicubic, antialias) when the runtime patch grid
+                // differs from the pretrain grid.
+                let tgt = xs.dim(1)?;
+                let src = pos_embed.dim(1)?;
+                // broadcast_add, not add: the learned grid is [1, h, w, c] and
+                // a batch of crops is [n, h, w, c]. Plain `+` requires equal
+                // shapes, so batching the encoder (Unlimited-OCR's tiled path
+                // sends 8 crops at a time) fails here with a shape mismatch.
+                // Identical to `+` when n == 1.
+                if tgt == src {
+                    xs.broadcast_add(pos_embed)?
+                } else {
+                    let dim = pos_embed.dim(3)?;
+                    let f = pos_embed.to_dtype(candle::DType::F32)?;
+                    let body: Vec<f32> = f.flatten_all()?.to_vec1()?;
+                    let resized =
+                        crate::models::interpolation::resize_grid_f32(&body, src, tgt, dim);
+                    let p = Tensor::from_vec(resized, (1, tgt, tgt, dim), pos_embed.device())?
+                        .to_dtype(pos_embed.dtype())?;
+                    xs.broadcast_add(&p)?
+                }
+            }
             None => xs,
         };
         for block in self.blocks.iter() {
