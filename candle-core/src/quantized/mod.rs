@@ -544,7 +544,15 @@ impl QTensor {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+        // `storage.quantize` below reads the raw storage buffer without going
+        // through the layout, so a view over a larger tensor (e.g. a narrowed
+        // expert slice out of a packed [num_experts, ...] parameter) would
+        // quantize the wrong elements; force_contiguous guarantees storage
+        // that exactly matches the tensor (one-shot load-time cost).
+        let src = src
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .force_contiguous()?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {
             crate::bail!(
