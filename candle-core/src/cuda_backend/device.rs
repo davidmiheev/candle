@@ -369,7 +369,26 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
+        // Prefer precompiled SASS (CANDLE_CUBIN builds): cuModuleLoad on a
+        // cubin file skips driver JIT entirely. cudarc exposes no public
+        // binary-image constructor, so the embedded bytes are dumped once
+        // to a content-addressed cache file and loaded by path.
+        let module_data = match mdl.image() {
+            Some(bytes) => {
+                let dir = std::env::temp_dir().join("candle-cubin");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(format!("m{}-{}.cubin", mdl.index(), bytes.len()));
+                if !path.exists() {
+                    let tmp = dir.join(format!(".m{}-{}.tmp", mdl.index(), std::process::id()));
+                    if std::fs::write(&tmp, bytes).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+                cudarc::nvrtc::Ptx::from_file(&path)
+            }
+            None => mdl.ptx().into(),
+        };
+        let cuda_module = self.context.load_module(module_data).w()?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {
