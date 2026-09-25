@@ -1,6 +1,6 @@
 use super::Config;
 use crate::models::with_tracing::{linear, linear_no_bias, Linear};
-use candle::{Device, IndexOp, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{embedding, Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
 
 fn conv1d(
@@ -33,6 +33,12 @@ struct MultiHeadAttention {
     softmax_span: tracing::Span,
     matmul_span: tracing::Span,
     kv_cache: Option<(Tensor, Tensor)>,
+    n_state: usize,
+    /// Static self-attn KV [n_head, max_seq, head_dim] for graph decode.
+    static_kv: Option<(Tensor, Tensor)>,
+    /// Address-stable cross-attn KV [1, n_head, audio_ctx, head_dim];
+    /// refreshed per request via copy_into so a captured graph stays valid.
+    cross_static: Option<(Tensor, Tensor)>,
 }
 
 impl MultiHeadAttention {
@@ -54,6 +60,9 @@ impl MultiHeadAttention {
             softmax_span,
             matmul_span,
             kv_cache: None,
+            n_state,
+            static_kv: None,
+            cross_static: None,
         })
     }
 
@@ -130,6 +139,103 @@ impl MultiHeadAttention {
         Ok(wv)
     }
 
+    fn head_dim(&self) -> usize {
+        self.n_state / self.n_head
+    }
+
+    fn enable_static_self(&mut self, max_seq: usize, dtype: DType, dev: &Device) -> Result<()> {
+        if self.static_kv.is_none() {
+            let shape = (self.n_head, max_seq, self.head_dim());
+            self.static_kv = Some((
+                Tensor::zeros(shape, dtype, dev)?,
+                Tensor::zeros(shape, dtype, dev)?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compute cross K/V from encoder output and write into address-stable
+    /// fixed-capacity buffers [n_head, max_actx, hd]. Segments may be shorter
+    /// than capacity (the last window of an audio file usually is); rows
+    /// beyond the segment length are masked at attention time.
+    fn set_cross_static(&mut self, xa: &Tensor, max_actx: usize) -> Result<usize> {
+        let hd = self.head_dim();
+        let k = self.reshape_head(&self.key.forward(xa)?)?.contiguous()?; // [1, h, n, hd]
+        let v = self.reshape_head(&self.value.forward(xa)?)?.contiguous()?;
+        let n = k.dim(2)?;
+        if n > max_actx {
+            candle::bail!("encoder output {n} exceeds cross capacity {max_actx}");
+        }
+        if self.cross_static.is_none() {
+            let shape = (self.n_head, max_actx, hd);
+            self.cross_static = Some((
+                Tensor::zeros(shape, k.dtype(), k.device())?,
+                Tensor::zeros(shape, k.dtype(), k.device())?,
+            ));
+        }
+        let (kb, vb) = self.cross_static.as_ref().unwrap();
+        let kc = k.reshape((self.n_head, n, hd))?.contiguous()?;
+        let vc = v.reshape((self.n_head, n, hd))?.contiguous()?;
+        candle_nn::fused::static_decode::kv_write_chunk(kb, &kc, 0)?;
+        candle_nn::fused::static_decode::kv_write_chunk(vb, &vc, 0)?;
+        Ok(n)
+    }
+
+    /// One-token self-attention over the static buffer at the device position.
+    fn forward_static_self(&mut self, x: &Tensor, pos: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let hd = self.head_dim();
+        let scale = (hd as f64).powf(-0.25);
+        let (kbuf, vbuf) = self
+            .static_kv
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static self-attn not enabled".into()))?
+            .clone();
+        let max_seq = kbuf.dim(1)?;
+
+        let q = self.query.forward(x)?; // [1, 1, n_state]
+        let k = self.key.forward(x)?;
+        let v = self.value.forward(x)?;
+        candle_nn::fused::static_decode::kv_write(
+            &kbuf,
+            &vbuf,
+            &k.reshape((self.n_head, 1, hd))?.contiguous()?,
+            &v.reshape((self.n_head, 1, hd))?.contiguous()?,
+            pos,
+        )?;
+        // q scaled once; k left unscaled in the buffer -> apply the second
+        // scale factor on the score (matches q*s @ (k*s)^T).
+        let q = (q.reshape((1, self.n_head, 1, hd))? * scale)?;
+        let qk = (q.matmul(&kbuf.unsqueeze(0)?.transpose(2, 3)?.contiguous()?)? * scale)?; // [1,h,1,max]
+        let qk = qk.broadcast_add(&mask.reshape((1, 1, 1, max_seq))?)?;
+        let w = candle_nn::ops::softmax_last_dim(&qk)?;
+        let wv = w
+            .matmul(&vbuf.unsqueeze(0)?.contiguous()?)? // [1,h,1,hd]
+            .transpose(1, 2)?
+            .flatten_from(2)?; // [1,1,n_state]
+        self.out.forward(&wv)
+    }
+
+    /// One-token cross-attention over the fixed-capacity cross buffers with
+    /// a length mask (rows past the segment's encoder length are -inf).
+    fn forward_static_cross(&self, x: &Tensor, cross_mask: &Tensor) -> Result<Tensor> {
+        let hd = self.head_dim();
+        let scale = (hd as f64).powf(-0.25);
+        let (kb, vb) = self
+            .cross_static
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("cross static not prepared".into()))?;
+        let max_actx = kb.dim(1)?;
+        let q = (self.query.forward(x)?.reshape((1, self.n_head, 1, hd))? * scale)?;
+        let qk = (q.matmul(&kb.unsqueeze(0)?.transpose(2, 3)?.contiguous()?)? * scale)?; // [1,h,1,cap]
+        let qk = qk.broadcast_add(&cross_mask.reshape((1, 1, 1, max_actx))?)?;
+        let w = candle_nn::ops::softmax_last_dim(&qk)?;
+        let wv = w
+            .matmul(&vb.unsqueeze(0)?.contiguous()?)?
+            .transpose(1, 2)?
+            .flatten_from(2)?;
+        self.out.forward(&wv)
+    }
+
     fn reset_kv_cache(&mut self) {
         self.kv_cache = None;
     }
@@ -188,6 +294,40 @@ impl ResidualAttentionBlock {
         let mut x = (x + attn)?;
         if let Some((attn, ln)) = &mut self.cross_attn {
             x = (&x + attn.forward(&ln.forward(&x)?, xa, None, flush_kv_cache)?)?;
+        }
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
+        x + mlp
+    }
+
+    fn enable_static(&mut self, max_seq: usize, dtype: DType, dev: &Device) -> Result<()> {
+        self.attn.enable_static_self(max_seq, dtype, dev)
+    }
+
+    fn set_cross_static(&mut self, xa: &Tensor, max_actx: usize) -> Result<usize> {
+        match &mut self.cross_attn {
+            Some((attn, _ln)) => attn.set_cross_static(xa, max_actx),
+            None => Ok(0),
+        }
+    }
+
+    fn forward_static(
+        &mut self,
+        x: &Tensor,
+        pos: &Tensor,
+        mask: &Tensor,
+        cross_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let attn = self
+            .attn
+            .forward_static_self(&self.attn_ln.forward(x)?, pos, mask)?;
+        let mut x = (x + attn)?;
+        if let Some((attn, ln)) = &self.cross_attn {
+            x = (&x + attn.forward_static_cross(&ln.forward(&x)?, cross_mask)?)?;
         }
         let mlp = self.mlp_linear2.forward(
             &self
@@ -310,6 +450,18 @@ pub struct TextDecoder {
     mask: Tensor,
     span: tracing::Span,
     span_final: tracing::Span,
+    static_ctx: Option<WhisperStaticCtx>,
+}
+
+/// Device-resident state for the shape-static whisper decode path.
+#[derive(Debug, Clone)]
+pub struct WhisperStaticCtx {
+    pub pos: Tensor,        // u32 [1]
+    pub mask: Tensor,       // additive causal row [max_seq]
+    pub cross_len: Tensor,  // u32 [1] — (segment encoder length - 1)
+    pub cross_mask: Tensor, // additive length row [max_actx]
+    pub max_seq: usize,
+    pub max_actx: usize,
 }
 
 impl TextDecoder {
@@ -339,6 +491,7 @@ impl TextDecoder {
             mask,
             span,
             span_final,
+            static_ctx: None,
         })
     }
 
@@ -352,6 +505,84 @@ impl TextDecoder {
             x = block.forward(&x, Some(xa), Some(&self.mask), flush_kv_cache)?;
         }
         self.ln.forward(&x)
+    }
+
+    /// Enable the shape-static decode path with a fixed sequence budget.
+    pub fn enable_static_decode(&mut self, max_seq: usize, max_actx: usize) -> Result<()> {
+        let dev = self.positional_embedding.device().clone();
+        let dtype = self.positional_embedding.dtype();
+        if self.static_ctx.is_none() {
+            self.static_ctx = Some(WhisperStaticCtx {
+                pos: Tensor::zeros(1, candle::DType::U32, &dev)?,
+                mask: Tensor::zeros(max_seq, dtype, &dev)?,
+                cross_len: Tensor::zeros(1, candle::DType::U32, &dev)?,
+                cross_mask: Tensor::zeros(max_actx, dtype, &dev)?,
+                max_seq,
+                max_actx,
+            });
+        }
+        for block in self.blocks.iter_mut() {
+            block.enable_static(max_seq, dtype, &dev)?;
+        }
+        Ok(())
+    }
+
+    pub fn static_enabled(&self) -> bool {
+        self.static_ctx.is_some()
+    }
+
+    /// Refresh the address-stable cross-attn K/V from a new encoder output
+    /// (per request/segment; safe outside graph capture only).
+    pub fn prepare_cross_static(&mut self, xa: &Tensor) -> Result<()> {
+        let max_actx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?
+            .max_actx;
+        let mut n = 0usize;
+        for block in self.blocks.iter_mut() {
+            let m = block.set_cross_static(xa, max_actx)?;
+            if m > 0 {
+                n = m;
+            }
+        }
+        let ctx = self.static_ctx.as_ref().unwrap();
+        // Length mask: allow columns 0..n (mask_from_pos allows j <= pos).
+        candle_nn::fused::static_decode::write_u32(&ctx.cross_len, (n.max(1) - 1) as u32)?;
+        candle_nn::fused::static_decode::mask_from_pos(&ctx.cross_mask, &ctx.cross_len, 0)?;
+        Ok(())
+    }
+
+    /// Rewind the static position (between segments; never inside a graph).
+    pub fn reset_static(&mut self) -> Result<()> {
+        match self.static_ctx.as_ref() {
+            Some(ctx) => candle_nn::fused::static_decode::write_u32(&ctx.pos, 0),
+            None => Ok(()),
+        }
+    }
+
+    /// One graph-replayable decode step: [1,1] token -> post-ln hidden [1,1,d].
+    /// Position enters via a device-side gather of the learned positional
+    /// embedding row; the causal mask row is rebuilt from the device pos.
+    pub fn forward_static(&mut self, token: &Tensor) -> Result<Tensor> {
+        let ctx = self
+            .static_ctx
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
+        candle_nn::fused::static_decode::mask_from_pos(&ctx.mask, &ctx.pos, 0)?;
+        let tok = self.token_embedding.forward(token)?; // [1,1,d]
+        let pe = self
+            .positional_embedding
+            .index_select(&ctx.pos, 0)?
+            .unsqueeze(0)?; // [1,1,d]
+        let mut x = tok.broadcast_add(&pe)?;
+        let (pos, mask, cross_mask) = (ctx.pos.clone(), ctx.mask.clone(), ctx.cross_mask.clone());
+        for block in self.blocks.iter_mut() {
+            x = block.forward_static(&x, &pos, &mask, &cross_mask)?;
+        }
+        let x = self.ln.forward(&x)?;
+        candle_nn::fused::static_decode::incr_u32(&pos)?;
+        Ok(x)
     }
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
