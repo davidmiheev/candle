@@ -571,7 +571,10 @@ impl TextDecoder {
             .ok_or_else(|| candle::Error::Msg("static decode not enabled".into()))?;
         candle_nn::fused::static_decode::mask_from_pos(&ctx.mask, &ctx.pos, 0)?;
         let tok = self.token_embedding.forward(token)?; // [1,1,d]
-        let pe = self.positional_embedding.index_select(&ctx.pos, 0)?.unsqueeze(0)?; // [1,1,d]
+        let pe = self
+            .positional_embedding
+            .index_select(&ctx.pos, 0)?
+            .unsqueeze(0)?; // [1,1,d]
         let mut x = tok.broadcast_add(&pe)?;
         let (pos, mask, cross_mask) = (ctx.pos.clone(), ctx.mask.clone(), ctx.cross_mask.clone());
         for block in self.blocks.iter_mut() {
