@@ -14,3 +14,11 @@ candle = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }
+
+[features]
+cuda = ["candle/cuda"]
+
+[[bin]]
+name = "capture-bisect"
+path = "src/bin/capture-bisect.rs"
+required-features = ["cuda"]
