@@ -1078,8 +1078,10 @@ impl Attention {
         candle_nn::fused::static_decode::kv_write(
             &kbuf,
             &vbuf,
-            &k.reshape((self.num_kv_heads, 1, self.head_dim))?.contiguous()?,
-            &v.reshape((self.num_kv_heads, 1, self.head_dim))?.contiguous()?,
+            &k.reshape((self.num_kv_heads, 1, self.head_dim))?
+                .contiguous()?,
+            &v.reshape((self.num_kv_heads, 1, self.head_dim))?
+                .contiguous()?,
             pos,
         )?;
 
