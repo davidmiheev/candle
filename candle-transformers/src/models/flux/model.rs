@@ -70,8 +70,33 @@ fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Te
     let q = q.flatten_to(batch_dims.len() - 1)?;
     let k = k.flatten_to(batch_dims.len() - 1)?;
     let v = v.flatten_to(batch_dims.len() - 1)?;
-    let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    let attn_scores = candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
+    // Chunk the query rows for long sequences so the [heads, seq, seq] score
+    // matrix never fully materializes (at 1024x1024 the 4608-token sequence
+    // needs ~2 GB per full score buffer in F32 — the difference between
+    // fitting and OOM on 24 GB cards). Softmax is row-independent, so the
+    // chunked result is byte-identical to the unchunked one.
+    let seq_q = q.dim(D::Minus2)?;
+    let chunk: usize = std::env::var("FLUX_ATTN_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let attn_scores = if seq_q <= chunk.max(1) {
+        let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
+        candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?
+    } else {
+        let kt = k.t()?.contiguous()?;
+        let mut outs = Vec::with_capacity(seq_q.div_ceil(chunk));
+        let mut start = 0usize;
+        while start < seq_q {
+            let len = chunk.min(seq_q - start);
+            let qc = q.narrow(D::Minus2, start, len)?;
+            let w = (qc.matmul(&kt)? * scale_factor)?;
+            let w = candle_nn::ops::softmax_last_dim(&w)?;
+            outs.push(w.matmul(&v)?);
+            start += len;
+        }
+        Tensor::cat(&outs, D::Minus2)?
+    };
     batch_dims.push(attn_scores.dim(D::Minus2)?);
     batch_dims.push(attn_scores.dim(D::Minus1)?);
     attn_scores.reshape(batch_dims)
