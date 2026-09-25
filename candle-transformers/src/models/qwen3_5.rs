@@ -803,16 +803,6 @@ impl GatedDeltaNet {
     }
 }
 
-fn expand_heads(x: &Tensor, group: usize) -> Result<Tensor> {
-    if group == 1 {
-        return Ok(x.clone());
-    }
-    let (h, d) = x.dims2()?;
-    x.unsqueeze(1)?
-        .expand((h, group, d))?
-        .reshape((h * group, d))
-}
-
 use crate::models::gemma4::text::qcache;
 use candle::quantized::{GgmlDType, QMatMul, QTensor};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -826,9 +816,9 @@ fn quant_setting() -> &'static Mutex<Option<GgmlDType>> {
 /// q8_0 (32-wide blocks) when it is not.
 fn quant_dtype_for(in_dim: usize, requested: GgmlDType) -> GgmlDType {
     let block = requested.block_size();
-    if block > 32 && in_dim % 256 != 0 {
+    if block > 32 && !in_dim.is_multiple_of(256) {
         GgmlDType::Q8_0
-    } else if in_dim % 32 != 0 {
+    } else if !in_dim.is_multiple_of(32) {
         // Should not happen for these checkpoints; keep unquantized-safe.
         requested
     } else {
@@ -1030,7 +1020,6 @@ struct DeviceMoe {
     ybuf: Tensor,     // f32 [H]
     row_gu: usize,
     row_dn: usize,
-    e: usize,
     inter: usize,
     h: usize,
 }
@@ -1045,6 +1034,7 @@ struct SparseMoe {
     top_k: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_device_moe(
     gu_bytes: &[u8],
     dn_bytes: &[u8],
@@ -1073,7 +1063,6 @@ fn build_device_moe(
         ybuf: Tensor::zeros(h, DType::F32, dev)?,
         row_gu,
         row_dn,
-        e,
         inter,
         h,
     })
@@ -1130,9 +1119,12 @@ impl SparseMoe {
                         let cpu = Device::Cpu;
                         let d_gu = quant_dtype_for(h, dtype);
                         let d_dn = quant_dtype_for(inter, dtype);
-                        anyhow_ok(h % d_gu.block_size() == 0, "gate/up rows not block-aligned")?;
                         anyhow_ok(
-                            inter % d_dn.block_size() == 0,
+                            h.is_multiple_of(d_gu.block_size()),
+                            "gate/up rows not block-aligned",
+                        )?;
+                        anyhow_ok(
+                            inter.is_multiple_of(d_dn.block_size()),
                             "down rows not block-aligned",
                         )?;
                         // gate_up: [E, 2I, H] -> flat rows, one quantize.
@@ -1381,7 +1373,7 @@ impl SparseMoe {
         use candle_nn::fused::static_decode as sd;
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let c = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if std::env::var("A5B_TRACE").is_ok() && c % 100 == 0 {
+        if std::env::var("A5B_TRACE").is_ok() && c.is_multiple_of(100) {
             let t = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
