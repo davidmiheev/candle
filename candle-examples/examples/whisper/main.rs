@@ -174,9 +174,14 @@ impl Decoder {
         if let Some(language_token) = self.language_token {
             tokens.push(language_token);
         }
-        match self.task {
-            None | Some(Task::Transcribe) => tokens.push(self.transcribe_token),
-            Some(Task::Translate) => tokens.push(self.translate_token),
+        // English-only checkpoints were trained on <|startoftranscript|> alone:
+        // no language and no task token. Only multilingual models, which always
+        // have a language token here, get the task token.
+        if self.language_token.is_some() {
+            match self.task {
+                None | Some(Task::Transcribe) => tokens.push(self.transcribe_token),
+                Some(Task::Translate) => tokens.push(self.translate_token),
+            }
         }
         if !self.timestamps {
             tokens.push(self.no_timestamps_token);
@@ -282,7 +287,8 @@ impl Decoder {
         let vocab_size = self.model.config().vocab_size as u32;
 
         // ========== SETUP: Extract sampled tokens for analysis ==========
-        let sample_begin = if self.language_token.is_some() { 3 } else { 2 };
+        // The prompt length: [SOT, language, task] or, for English-only models, [SOT].
+        let sample_begin = if self.language_token.is_some() { 3 } else { 1 };
         let sampled_tokens = if tokens.len() > sample_begin {
             &tokens[sample_begin..]
         } else {
@@ -301,10 +307,14 @@ impl Decoder {
                 .map(|&t| t >= timestamp_begin)
                 .unwrap_or(false);
 
+            // With fewer than two sampled tokens the reference treats the pair as
+            // closed (`len(seq) < 2 or seq[-2] >= timestamp_begin`), so the token
+            // after the initial timestamp must be text rather than a second
+            // timestamp that would close an empty segment.
             let penultimate_was_timestamp = if sampled_tokens.len() >= 2 {
                 sampled_tokens[sampled_tokens.len() - 2] >= timestamp_begin
             } else {
-                false
+                true
             };
 
             if last_was_timestamp {
@@ -469,7 +479,8 @@ impl Decoder {
                     }
                     // The no_timestamp_token is the last before the timestamp ones.
                     if token > self.no_timestamps_token {
-                        let timestamp_s = (token - self.no_timestamps_token + 1) as f32 / 50.;
+                        // <|0.00|> is the token right after <|notimestamps|>.
+                        let timestamp_s = (token - self.no_timestamps_token - 1) as f32 / 50.;
                         if !tokens_to_decode.is_empty() {
                             let text = self
                                 .tokenizer
