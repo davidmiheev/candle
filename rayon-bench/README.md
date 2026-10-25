@@ -14,8 +14,9 @@ Binaries (one process per thread setting, because candle sizes its pools once pe
 Variants built by the commands below; `sweep.sh` iterates `RAYON_NUM_THREADS = CANDLE_NUM_THREADS = 1 2 4 8`.
 
 ```bash
-# candle fork (this checkout)
-cargo build --release                                                  # fork-base
+# candle fork (this checkout). NOTE: candle's .cargo/config.toml sets target-cpu=native for
+# everything built inside this repo, so a "no flags" build must override it explicitly.
+RUSTFLAGS="-C target-cpu=x86-64" cargo build --release --target-dir target-truebase   # fork-base
 RUSTFLAGS="-C target-cpu=native" cargo build --release --target-dir target-native   # fork-native / fork-ctx
 # candle 0.10.2 from crates.io (what ignite-catalog pins today)
 (cd v0102 && RUSTFLAGS="--cfg candle_0102" cargo build --release)
@@ -32,4 +33,6 @@ REPS=1 ./sweep.sh qmatmul > results/qmatmul.csv
 Notes
 - candle >= 0.11 runs quantized matmul on its own barrier pool sized by `CANDLE_NUM_THREADS`;
   `RAYON_NUM_THREADS` only sizes rayon (gemm, softmax, etc.). 0.10.2 uses rayon for both.
-- Quantized kernels are selected with `cfg(target_feature)`, so `RUSTFLAGS` decides whether AVX2/AVX-512 paths exist at all.
+- Quantized kernels are selected with `cfg(target_feature)` (no runtime detection), so `RUSTFLAGS` decides
+  whether the AVX2 paths exist at all. Any `RUSTFLAGS` env var replaces `build.rustflags` from
+  `.cargo/config.toml` entirely.

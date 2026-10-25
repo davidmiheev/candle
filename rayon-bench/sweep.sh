@@ -4,7 +4,7 @@
 # Variants (binaries must be built first, see README.md):
 #   v0102-base   candle 0.10.2 from crates.io, default RUSTFLAGS  (what ignite pins today)
 #   v0102-native candle 0.10.2, -C target-cpu=native
-#   fork-base    candle fork (0.11), default RUSTFLAGS
+#   fork-base    candle fork (0.11), -C target-cpu=x86-64 (overrides candle's .cargo/config native)
 #   fork-native  candle fork (0.11), -C target-cpu=native
 #   fork-ctx     fork-native + Device::with_context around generation
 #   anth-ctx     fork-ctx built against Anthropic's rayon-core 1.13.5000+anthropic
@@ -16,7 +16,7 @@ REPS=${REPS:-2}
 declare -A BIN=(
   [v0102-base]=v0102/target/release
   [v0102-native]=v0102/target-native/release
-  [fork-base]=target/release
+  [fork-base]=target-truebase/release
   [fork-native]=target-native/release
   [fork-ctx]=target-native/release
   [anth-ctx]=anth/target/release
