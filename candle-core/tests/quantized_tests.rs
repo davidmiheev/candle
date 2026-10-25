@@ -1513,3 +1513,77 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+/// The CPU (de)quantizers split work across rayon tasks on block (or row, for imatrix)
+/// boundaries; check the result is byte-identical to a single serial call.
+fn serial_quantize<T: GgmlType>(xs: &[f32], imatrix: Option<(&[f32], usize)>) -> Vec<u8> {
+    let mut ys = vec![T::zeros(); xs.len() / T::BLCK_SIZE];
+    match imatrix {
+        None => T::from_float(xs, &mut ys),
+        Some((w, n_per_row)) => T::from_float_imatrix(xs, &mut ys, w, n_per_row),
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            ys.as_ptr() as *const u8,
+            std::mem::size_of_val(ys.as_slice()),
+        )
+    };
+    bytes.to_vec()
+}
+
+fn serial_dequantize<T: GgmlType>(data: &[u8], n: usize) -> Vec<f32> {
+    let blocks = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, n / T::BLCK_SIZE) };
+    let mut ys = vec![0f32; n];
+    T::to_float(blocks, &mut ys);
+    ys
+}
+
+#[test]
+fn parallel_quantize_matches_serial() -> Result<()> {
+    use k_quants::*;
+    let cpu = &Device::Cpu;
+    // 1M weights: 4096 k-quant blocks / 32768 legacy blocks, enough to take the parallel path.
+    let (rows, cols) = (256, 4096);
+    let xs = Tensor::randn(0f32, 1f32, (rows, cols), cpu)?;
+    let xs_v = xs.flatten_all()?.to_vec1::<f32>()?;
+    let imatrix: Vec<f32> = (0..cols).map(|i| 0.5 + (i % 7) as f32).collect();
+
+    macro_rules! check {
+        ($dtype:expr, $ty:ty, $imatrix:expr) => {{
+            let q = quantized::QTensor::quantize(&xs, $dtype)?;
+            let data = q.data()?;
+            assert!(
+                data.as_ref() == serial_quantize::<$ty>(&xs_v, None).as_slice(),
+                "{:?} quantize",
+                $dtype
+            );
+            let dq = q.dequantize(cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(
+                dq == serial_dequantize::<$ty>(&data, xs_v.len()),
+                "{:?} dequantize",
+                $dtype
+            );
+            if $imatrix {
+                let q = quantized::QTensor::quantize_imatrix(&xs, &imatrix, $dtype)?;
+                let want = serial_quantize::<$ty>(&xs_v, Some((&imatrix, cols)));
+                assert!(
+                    q.data()?.as_ref() == want.as_slice(),
+                    "{:?} imatrix",
+                    $dtype
+                );
+            }
+        }};
+    }
+    check!(GgmlDType::Q4_0, BlockQ4_0, false);
+    check!(GgmlDType::Q4_1, BlockQ4_1, false);
+    check!(GgmlDType::Q5_0, BlockQ5_0, false);
+    check!(GgmlDType::Q5_1, BlockQ5_1, false);
+    check!(GgmlDType::Q8_0, BlockQ8_0, false);
+    check!(GgmlDType::Q2K, BlockQ2K, true);
+    check!(GgmlDType::Q3K, BlockQ3K, true);
+    check!(GgmlDType::Q4K, BlockQ4K, true);
+    check!(GgmlDType::Q5K, BlockQ5K, true);
+    check!(GgmlDType::Q6K, BlockQ6K, true);
+    check!(GgmlDType::Q8K, BlockQ8K, false);
+    Ok(())
+}

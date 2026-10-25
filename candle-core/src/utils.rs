@@ -321,7 +321,10 @@ fn default_num_threads() -> usize {
             num_cpus::get_physical()
         }
     };
-    physical.max(1) // safeguard against bad number
+    // `get_physical` reads /proc/cpuinfo, which ignores CPU affinity and cgroup quotas.
+    // In a container limited to fewer CPUs than the host has, the spin-waiting barrier
+    // pool would then oversubscribe badly, so cap at the CPUs this process may use.
+    physical.min(num_cpus::get()).max(1) // safeguard against bad number
 }
 
 fn rayon_num_threads() -> usize {

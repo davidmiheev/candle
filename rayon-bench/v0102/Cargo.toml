@@ -1,0 +1,34 @@
+[package]
+autobins = false
+name = "rayon-bench-v0102"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "CPU thread-count / rayon experiments for candle quantized inference"
+
+# Standalone: not part of the candle workspace.
+[workspace]
+
+[dependencies]
+candle-core = "=0.10.2"
+candle-nn = "=0.10.2"
+candle-transformers = "=0.10.2"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+anyhow = "1"
+rayon = "1.11"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "llm_sweep"
+path = "../src/bin/llm_sweep.rs"
+[[bin]]
+name = "qmatmul_sweep"
+path = "../src/bin/qmatmul_sweep.rs"
+[[bin]]
+name = "quantize_sweep"
+path = "../src/bin/quantize_sweep.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(candle_0102)'] }
