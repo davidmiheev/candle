@@ -1,0 +1,23 @@
+[package]
+name = "rayon-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "CPU thread-count / rayon experiments for candle quantized inference"
+
+# Standalone: not part of the candle workspace.
+[workspace]
+
+[dependencies]
+candle-core = { path = "../candle-core" }
+candle-nn = { path = "../candle-nn" }
+candle-transformers = { path = "../candle-transformers" }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+anyhow = "1"
+rayon = "1.11"
+
+[profile.release]
+debug = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(candle_0102)'] }

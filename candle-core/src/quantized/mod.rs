@@ -2,6 +2,7 @@ use crate::{
     backend::BackendStorage, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
 };
 use k_quants::*;
+use rayon::prelude::*;
 use std::{borrow::Cow, sync::OnceLock};
 
 #[cfg(target_feature = "avx2")]
@@ -438,6 +439,10 @@ pub trait QuantizedType: Send + Sync {
     fn size(&self) -> usize;
 }
 
+/// Blocks per rayon task when (de)quantizing on the CPU. Large enough that task overhead is
+/// negligible (~256K weights), small enough to balance a single weight matrix across cores.
+const PAR_BLOCKS_PER_TASK: usize = 1024;
+
 impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         k_quants::matmul(mkn, lhs, self.as_slice(), dst)
@@ -479,11 +484,29 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     }
 
     fn from_float(&mut self, xs: &[f32]) {
-        T::from_float(xs, self)
+        // Blocks are quantized independently, so splitting on block boundaries gives
+        // byte-identical output to the serial call.
+        if self.len() < 2 * PAR_BLOCKS_PER_TASK {
+            return T::from_float(xs, self);
+        }
+        xs.par_chunks(PAR_BLOCKS_PER_TASK * T::BLCK_SIZE)
+            .zip(self.par_chunks_mut(PAR_BLOCKS_PER_TASK))
+            .for_each(|(xs, ys)| T::from_float(xs, ys));
     }
 
     fn from_float_imatrix(&mut self, xs: &[f32], imatrix_weights: &[f32], n_per_row: usize) {
-        T::from_float_imatrix(xs, self, imatrix_weights, n_per_row)
+        // The importance weights are per column, so whole rows can be quantized independently.
+        let blocks_per_row = n_per_row / T::BLCK_SIZE;
+        if blocks_per_row == 0
+            || !n_per_row.is_multiple_of(T::BLCK_SIZE)
+            || self.len() < 2 * PAR_BLOCKS_PER_TASK
+        {
+            return T::from_float_imatrix(xs, self, imatrix_weights, n_per_row);
+        }
+        let rows_per_task = PAR_BLOCKS_PER_TASK.div_ceil(blocks_per_row);
+        xs.par_chunks(rows_per_task * n_per_row)
+            .zip(self.par_chunks_mut(rows_per_task * blocks_per_row))
+            .for_each(|(xs, ys)| T::from_float_imatrix(xs, ys, imatrix_weights, n_per_row));
     }
 
     fn dtype(&self) -> GgmlDType {
@@ -496,7 +519,13 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
 
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
         let mut ys = vec![0.0f32; elem_count];
-        T::to_float(self.as_slice(), &mut ys);
+        if self.len() < 2 * PAR_BLOCKS_PER_TASK || elem_count != self.len() * T::BLCK_SIZE {
+            T::to_float(self.as_slice(), &mut ys);
+        } else {
+            self.par_chunks(PAR_BLOCKS_PER_TASK)
+                .zip(ys.par_chunks_mut(PAR_BLOCKS_PER_TASK * T::BLCK_SIZE))
+                .for_each(|(xs, ys)| T::to_float(xs, ys));
+        }
         Ok(CpuStorage::F32(ys))
     }
 
